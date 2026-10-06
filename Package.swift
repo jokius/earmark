@@ -36,8 +36,12 @@ let package = Package(
             url: "\(whisperRelease)/whisper-b5130-xcframework.zip",
             checksum: "033a43b0174e8cf9b366f72e4a428cdcf126f93ad1c87d3fa119a96bed6f231a"
         ),
+        // Только для SIGKILL-теста EarmarkAudioTests: процесс, который не жалко убить посреди записи.
+        .executableTarget(
+            name: "earmark-crash-helper", dependencies: ["EarmarkAudio"], path: "Tests/CrashHelper"),
         .testTarget(name: "EarmarkCoreTests", dependencies: ["EarmarkCore"]),
-        .testTarget(name: "EarmarkAudioTests", dependencies: ["EarmarkAudio"]),
+        .testTarget(
+            name: "EarmarkAudioTests", dependencies: ["EarmarkAudio", "EarmarkCore", "earmark-crash-helper"]),
         .testTarget(name: "EarmarkTranscriptionTests", dependencies: ["EarmarkTranscription"]),
         .testTarget(name: "EarmarkCLITests", dependencies: ["EarmarkCLI"]),
     ],

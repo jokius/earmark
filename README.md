@@ -231,8 +231,8 @@ earmark itself — notification sounds and music included.
 
 ## Troubleshooting
 
-- Start with `earmark doctor`. `earmark doctor --audio-test` also plays a short 440 Hz tone and
-  checks that the system audio channel hears it: without permission the channel records silence
+- Start with `earmark doctor`. `earmark doctor --audio-test` also plays a short quiet 440 Hz tone
+  and checks that the system audio channel hears it: without permission the channel records silence
   without any error, so this is the only reliable check.
 - **The far end is silent**, or `far_end_digital_silence` shows up in `earmark status`: the
   system audio permission is missing or stale. Reset it and grant it again:

@@ -130,7 +130,9 @@ public enum CommandTable {
         CommandSpec(
             path: ["doctor"],
             summary: "Check app, permissions, calendars, folders, model; exit 1 if not ready",
-            options: [flag("--audio-test", "Also play a short tone and check that system audio hears it")],
+            options: [
+                flag("--audio-test", "Also play a short quiet tone and check that system audio hears it")
+            ],
             needsApp: true, mcpTool: "doctor", readOnly: true),
         CommandSpec(
             path: ["permissions", "request"], summary: "Ask the app to show the system permission prompts",

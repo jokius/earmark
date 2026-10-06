@@ -65,6 +65,7 @@ final class AppModel {
     func stopRecording() async throws(EarmarkError) -> RecordingMeta? {
         try await session.stop(reason: .manual)
     }
+    let permissions = Permissions()
 
     /// status() начинает с него, а каждая задача, которой есть что сказать, дописывает своё
     /// перед `return data`. Версия — EarmarkVersion (Task 1): одна на app, CLI и meta.json.
@@ -117,7 +118,24 @@ final class AppModel {
             data.recording = current
         }
         data.warnings += recordingWarnings
+        data.permissions = permissions.current()
         return data
+    }
+
+    // MARK: - права
+
+    func requestPermissions() async -> PermissionsInfo {
+        let result = await permissions.request()
+        refreshSnapshot()
+        return result
+    }
+
+    /// Тон слышно в динамиках, и во время записи он попал бы в канал собеседников — отсюда busy.
+    func audioTest() async throws(EarmarkError) -> DoctorCheck {
+        guard status().state != "recording" else {
+            throw EarmarkError.busy("audio test would be heard in the recording in progress")
+        }
+        return await AudioSelfTest.run()
     }
 
     /// Красный значок. В DEBUG его включает аргумент `-debugRecordingIcon YES`: так отрисовку

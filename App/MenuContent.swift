@@ -18,10 +18,25 @@ struct MenuContent: View {
         ForEach(model.snapshot.warnings, id: \.self) { warning in
             Text("Warning: \(warning)")
         }
+        if let permissions = model.snapshot.permissions, !permissions.allGranted {
+            Divider()
+            Button("Grant Permissions…") { Task { _ = await model.requestPermissions() } }
+            Text(
+                "Microphone: \(permissions.microphone) · Calendars: \(permissions.calendars) · "
+                    + "System audio: \(permissions.audioCapture)")
+        }
 
         Divider()
 
         Button("Open Recordings Folder") { model.openRecordingsFolder() }
+        #if DEBUG
+        // Ручные проверки до появления IPC; результат — в `/usr/bin/log stream`, категория audio-test.
+        Menu("Debug") {
+            Button("Run Audio Self-Test (plays a short quiet tone)") {
+                Task { _ = try? await model.audioTest() }
+            }
+        }
+        #endif
 
         Divider()
 

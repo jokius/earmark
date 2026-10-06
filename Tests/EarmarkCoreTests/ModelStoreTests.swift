@@ -252,10 +252,37 @@ struct ModelStoreTests {
 
     @Test("206 с Content-Length не равным остатку — unavailable (69), .partial не тронут")
     func wrongPartialContentLengthKeepsPartial() async throws {
-        // Остаток после 100 000 байт — 200 000, а сервер прислал хвост от 50 000.
-        let tail = fakeModel.subdata(in: 50_000..<fakeModel.count)
+        // Начало верное, но остаток после 100 000 байт — 200 000, а пришло 100 000.
+        let short = fakeModel.subdata(in: 100_000..<200_000)
         let server = FakeHF(
-            blob: fakeModel, fixed: .init(status: 206, body: tail, contentRange: "bytes 50000-299999/300000"))
+            blob: fakeModel,
+            fixed: .init(status: 206, body: short, contentRange: "bytes 100000-199999/300000"))
+        let store = ModelStore(dir: try tempDir(), session: server.session())
+        let manifest = try server.manifest()
+        let head = fakeModel.subdata(in: 0..<100_000)
+        try head.write(to: partial(store, manifest))
+
+        let error = await #expect(throws: EarmarkError.self) {
+            try await store.download(manifest, progress: noProgress)
+        }
+
+        #expect(error?.code == "unavailable")
+        #expect(error?.exitCode == 69)
+        #expect(FileManager.default.contents(atPath: partial(store, manifest).path) == head)
+        #expect(!FileManager.default.fileExists(atPath: store.path(for: manifest).path))
+        #expect(server.ranges == ["bytes=100000-"])
+    }
+
+    @Test(
+        "206 без Content-Range или не с байта докачки — unavailable (69), .partial не тронут",
+        arguments: [nil, 50_000] as [Int?])
+    func resumeWithoutMatchingContentRange(from: Int?) async throws {
+        // Content-Length верный (200 000), решает только Content-Range.
+        let start = from ?? 100_000
+        let body = fakeModel.subdata(in: start..<start + 200_000)
+        let contentRange = from.map { "bytes \($0)-\($0 + 199_999)/300000" }
+        let server = FakeHF(
+            blob: fakeModel, fixed: .init(status: 206, body: body, contentRange: contentRange))
         let store = ModelStore(dir: try tempDir(), session: server.session())
         let manifest = try server.manifest()
         let head = fakeModel.subdata(in: 0..<100_000)

@@ -59,9 +59,9 @@ public enum Registry {
         return try await AppCommands.enqueueTranscription(parsed, context)
     }
 
-    /// Воркер транскрипции. Пока whisper не подключён — честный отказ, а не тихая очередь.
-    static let transcribeNow: CommandHandler = { _, _ in
-        throw EarmarkError.unavailable("transcribe --now is not available in this build")
+    /// Воркер транскрипции: так его запускает app (§8.3) и так же — человек или агент.
+    static let transcribeNow: CommandHandler = { parsed, context in
+        try await TranscribeNowCommand.run(parsed, context)
     }
 }
 

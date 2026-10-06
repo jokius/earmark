@@ -10,7 +10,10 @@ import Foundation
 /// события не текут: планировщик живёт в EarmarkCore и тестируется без календаря и без прав.
 @MainActor
 final class CalendarService {
-    private let store = EKEventStore()
+    /// Один store на процесс, и Permissions просит доступ через него же: со своим store в Permissions
+    /// этот, созданный до гранта, оставался пустым до перезапуска app (воспроизведено на приёмке).
+    static let shared = EKEventStore()
+    private let store = CalendarService.shared
     private var observer: (any NSObjectProtocol)?
 
     /// Любое изменение календаря и смена прав: заголовок EKEventStore.h обещает уведомление и тогда,

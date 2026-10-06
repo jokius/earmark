@@ -31,10 +31,12 @@ final class Permissions {
             _ = await AVCaptureDevice.requestAccess(for: .audio)
         }
         if calendars() == "not_determined" {
-            // Свой store: запросу не нужен CalendarService, а уведомление о смене прав EventKit
-            // разошлёт всем store процесса (EKEventStore.h).
-            let store = EKEventStore()
-            calendarsAnswer = (try? await store.requestFullAccessToEvents()) ?? false
+            // Тот же store, из которого читает CalendarService: доступ видит только запросивший store.
+            calendarsAnswer = await withCheckedContinuation { continuation in
+                CalendarService.shared.requestFullAccessToEvents { granted, _ in
+                    continuation.resume(returning: granted)
+                }
+            }
         }
         let audio = audioCapture(maxAge: 0)
         if audio == "not_determined" || audio == "unknown" {

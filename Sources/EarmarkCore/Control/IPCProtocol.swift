@@ -23,6 +23,15 @@ public struct IPCRequest: Codable, Equatable, Sendable {
         self.method = method
         self.params = params
     }
+
+    /// Без `v` и `params` — версия 1 и пустые params (ручной `nc`, сторонний клиент): синтезированный
+    /// Decodable дефолты свойств не видит и требовал бы оба ключа.
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        v = try container.decodeIfPresent(Int.self, forKey: .v) ?? 1
+        method = try container.decode(String.self, forKey: .method)
+        params = try container.decodeIfPresent(JSONValue.self, forKey: .params) ?? [:]
+    }
 }
 
 /// {"ok":true,"data":…} или {"ok":false,"error":{…}}.

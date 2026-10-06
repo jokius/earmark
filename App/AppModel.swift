@@ -72,6 +72,10 @@ final class AppModel {
     let permissions = Permissions()
     let calendarService = CalendarService()
     @ObservationIgnored private var scheduler: SchedulerDriver?
+    @ObservationIgnored private var server: IPCServer?
+    @ObservationIgnored private var socketProblem: String?
+    /// Два самотеста разом — два afplay и два tap: меню и `doctor --audio-test` не должны пересечься.
+    @ObservationIgnored private var audioTestRunning = false
 
     /// status() начинает с него, а каждая задача, которой есть что сказать, дописывает своё
     /// перед `return data`. Версия — EarmarkVersion (Task 1): одна на app, CLI и meta.json.
@@ -121,6 +125,31 @@ final class AppModel {
 
     func shutdown() {
         ticker?.cancel()
+        server?.stop()
+    }
+
+    /// Поднимает IPC-сокет (§9.2). false — сокет уже обслуживает другой экземпляр: этот должен
+    /// выйти, не тронув ни микрофон, ни state.json. Прочие сбои сокета не повод не писать по
+    /// календарю: причина уходит в status, а CLI увидит app_not_running.
+    func startIPC() -> Bool {
+        do {
+            try EarmarkPaths.ensureSupportDir()
+        } catch {
+            socketProblem = "support dir: \(error.localizedDescription)"
+            return true
+        }
+        let server = IPCServer(socket: EarmarkPaths.socketFile) { [weak self] request, peer in
+            guard let self else { return .failure(.unavailable("earmark is shutting down")) }
+            return await IPCHandlers.handle(request, peer: peer, model: self)
+        }
+        do {
+            try server.start()
+            self.server = server
+        } catch {
+            if error.code == "busy" { return false }
+            socketProblem = error.message
+        }
+        return true
     }
 
     func status() -> StatusData {
@@ -138,6 +167,7 @@ final class AppModel {
         if let stale = scheduler?.staleCalendarIDs, !stale.isEmpty {
             data.warnings.append("stale_calendars:" + stale.joined(separator: ","))
         }
+        if let socketProblem { data.warnings.append("socket: \(socketProblem)") }
         return data
     }
 
@@ -150,10 +180,19 @@ final class AppModel {
     }
 
     /// Тон слышно в динамиках, и во время записи он попал бы в канал собеседников — отсюда busy.
+    /// Пока на системный звук не ответили, первый старт tap висит на системном запросе дольше
+    /// таймаута IPC (S1): такой тест не запускаем, запрос — дело `permissions request`.
     func audioTest() async throws(EarmarkError) -> DoctorCheck {
         guard status().state != "recording" else {
             throw EarmarkError.busy("audio test would be heard in the recording in progress")
         }
+        guard !audioTestRunning else { throw EarmarkError.busy("an audio test is already running") }
+        guard permissions.current(maxAge: 0).audioCapture != "not_determined" else {
+            throw EarmarkError.permissionDenied(
+                "System Audio Recording has not been granted yet: run earmark permissions request")
+        }
+        audioTestRunning = true
+        defer { audioTestRunning = false }
         return await AudioSelfTest.run()
     }
 
@@ -253,6 +292,137 @@ final class AppModel {
         }
         config = next
         configProblem = nil
+    }
+
+    // MARK: - doctor
+
+    /// Всё, что должно быть готово, чтобы созвон записался и расшифровался (§10). CLI выходит
+    /// с кодом 1, если ready == false.
+    func doctor(audioTest: Bool) async -> DoctorReport {
+        let pid = ProcessInfo.processInfo.processIdentifier
+        var checks = [
+            DoctorCheck(name: "app", ok: true, detail: "pid \(pid), version \(EarmarkVersion.current)"),
+            DoctorCheck(
+                name: "socket", ok: server != nil, detail: socketProblem ?? EarmarkPaths.socketFile.path),
+        ]
+        let access = permissions.current(maxAge: 0)
+        for (name, value) in [
+            ("microphone", access.microphone), ("audio_capture", access.audioCapture),
+            ("calendars", access.calendars),
+        ] {
+            checks.append(DoctorCheck(name: name, ok: value == "granted", detail: value))
+        }
+        let stale = scheduler?.staleCalendarIDs ?? []
+        checks.append(
+            DoctorCheck(
+                name: "enabled_calendars", ok: stale.isEmpty,
+                detail: stale.isEmpty
+                    ? "\(config.calendars.count) enabled"
+                    : "missing in EventKit: " + stale.joined(separator: ", ")))
+        checks.append(recordingsDirCheck())
+        checks.append(await modelCheck())
+        checks.append(vadCheck())
+        let cli = Self.cliExecutable?.path
+        checks.append(
+            DoctorCheck(
+                name: "cli", ok: cli != nil, detail: cli ?? "earmark CLI is missing from Contents/Helpers"))
+        checks.append(diskCheck())
+        checks.append(loginItemCheck())
+        if audioTest {
+            do {
+                checks.append(try await self.audioTest())
+            } catch {
+                checks.append(DoctorCheck(name: "audio_test", ok: false, detail: error.message))
+            }
+        }
+        return DoctorReport(ready: checks.allSatisfy(\.ok), checks: checks)
+    }
+
+    /// CLI в бандле (он же воркер транскрипции) лежит в Contents/Helpers (Task 1, D1). Не через
+    /// url(forAuxiliaryExecutable:): тот ищет в Contents/MacOS, где на регистронезависимом APFS
+    /// «earmark» и «Earmark» — один файл, то есть сам app.
+    static var cliExecutable: URL? {
+        let cli = Bundle.main.bundleURL.appending(path: "Contents/Helpers/earmark")
+        return FileManager.default.isExecutableFile(atPath: cli.path) ? cli : nil
+    }
+
+    private func recordingsDirCheck() -> DoctorCheck {
+        let dir = config.recordingsDir
+        // Та же проверка, что у config set: защищённые TCC папки и доступность на запись (§7.1).
+        do {
+            _ = try ConfigSchema.parse(dir.path, for: "recordings_dir")
+            return DoctorCheck(name: "recordings_dir", ok: true, detail: dir.path)
+        } catch {
+            return DoctorCheck(name: "recordings_dir", ok: false, detail: error.description)
+        }
+    }
+
+    /// Размер и sha256 (§10, D35): обрезанную или подменённую модель видно только по хэшу.
+    private func modelCheck() async -> DoctorCheck {
+        // sha256 полутора гигабайт — 1–4 с CPU: не на главном акторе.
+        let result = await Task.detached(priority: .userInitiated) {
+            Result { try ModelStore().state(of: Models.largeV3Turbo, verify: true) }
+        }.value
+        let state: ModelState
+        switch result {
+        case .success(let value):
+            state = value
+        case .failure(let error):
+            return DoctorCheck(name: "model", ok: false, detail: error.localizedDescription)
+        }
+        switch state {
+        case .ready(let url):
+            return DoctorCheck(name: "model", ok: true, detail: url.path)
+        case .missing:
+            return DoctorCheck(
+                name: "model", ok: false, detail: "missing: earmark model download (or model import)")
+        case .downloading(let received, let total):
+            return DoctorCheck(
+                name: "model", ok: false, detail: "downloading \(received * 100 / max(total, 1))%")
+        case .corrupt(let url):
+            return DoctorCheck(
+                name: "model", ok: false, detail: "corrupt (size or sha256 mismatch): \(url.path)")
+        }
+    }
+
+    /// VAD лежит в корне Resources бандла (D35); размер сверяем с манифестом — обрезанная копия
+    /// не загрузится.
+    private func vadCheck() -> DoctorCheck {
+        let vad = Models.sileroVAD
+        guard let url = Bundle.main.url(forResource: vad.fileName, withExtension: nil) else {
+            return DoctorCheck(
+                name: "vad", ok: false, detail: "\(vad.fileName) is missing from the app bundle")
+        }
+        let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize
+        return DoctorCheck(name: "vad", ok: size.map { Int64($0) == vad.size } ?? false, detail: url.path)
+    }
+
+    /// 2 ГБ: час записи в CAF — около 0.7 ГБ, плюс итоговый m4a и временные файлы сведения.
+    private func diskCheck() -> DoctorCheck {
+        var probe = config.recordingsDir
+        while !FileManager.default.fileExists(atPath: probe.path), probe.pathComponents.count > 1 {
+            probe.deleteLastPathComponent()
+        }
+        let free = (try? probe.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
+            .volumeAvailableCapacityForImportantUsage
+        guard let free else { return DoctorCheck(name: "disk", ok: false, detail: "cannot read free space") }
+        return DoctorCheck(
+            name: "disk", ok: free >= 2_000_000_000,
+            detail: ByteCountFormatter.string(fromByteCount: free, countStyle: .file) + " free")
+    }
+
+    private func loginItemCheck() -> DoctorCheck {
+        guard Self.isInstalled else {
+            return DoctorCheck(
+                name: "login_item", ok: true, detail: "not installed in /Applications (dev build)")
+        }
+        if LaunchAtLogin.isEnabled { return DoctorCheck(name: "login_item", ok: true, detail: "enabled") }
+        if LaunchAtLogin.requiresApproval {
+            return DoctorCheck(
+                name: "login_item", ok: !config.launchAtLogin,
+                detail: "requires approval: System Settings → General → Login Items")
+        }
+        return DoctorCheck(name: "login_item", ok: !config.launchAtLogin, detail: "not registered")
     }
 
     // MARK: - система

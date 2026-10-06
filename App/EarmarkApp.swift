@@ -53,6 +53,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.terminate(nil)
             return
         }
+        // Вторая линия single instance: сокет отвечает — значит, его держит живой экземпляр.
+        guard model.startIPC() else {
+            logger.notice("another instance is serving the socket, exiting")
+            NSApp.terminate(nil)
+            return
+        }
         model.start()
     }
 

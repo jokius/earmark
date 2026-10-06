@@ -79,6 +79,15 @@ struct ControlProtocolTests {
         #expect(try IPCFraming.decode(IPCRequest.self, from: line.dropLast()) == request)
     }
 
+    @Test("запрос без v и params — v 1 и пустые params; без method — bad_data")
+    func tolerantRequest() throws {
+        let bare = try IPCFraming.decode(IPCRequest.self, from: Data(#"{"method":"status"}"#.utf8))
+        #expect(bare == IPCRequest(method: "status", params: [:]))
+        #expect(throws: EarmarkError.self) {
+            try IPCFraming.decode(IPCRequest.self, from: Data(#"{"v":1}"#.utf8))
+        }
+    }
+
     @Test("строка больше 1 MiB и мусор — bad_data")
     func framingLimits() {
         let huge = Data(repeating: 0x20, count: IPCFraming.maxLineBytes + 1)

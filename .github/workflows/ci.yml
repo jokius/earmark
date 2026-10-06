@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # Новый пуш в ту же ветку отменяет предыдущий прогон: время macOS-раннеров дорогое,
+  # держать очередь из устаревших сборок незачем.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    # Образ xcode-27 (macOS 27 + Xcode 27, preview): пакету нужен Swift 6.4 (swift-tools-version 6.4)
+    # и SDK 27 — в нём AVAudioFile и AVAudioFormat перестали быть Sendable, ловим это здесь.
+    runs-on: xcode-27
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Показать окружение
+        run: |
+          xcodebuild -version
+          swift --version
+
+      # xcodegen обязателен: .xcodeproj в репозитории нет, он генерируется.
+      # swiftlint нужен для `make lint`; на образе нет ни того, ни другого.
+      - name: Поставить xcodegen и swiftlint
+        run: brew install xcodegen swiftlint
+
+      - name: Формат
+        run: make fmt-check
+
+      - name: Линт
+        run: make lint
+
+      # Только пакетные тесты: TCC, модель whisper и звуковое железо в CI недоступны (§11).
+      - name: Тесты
+        run: make test
+
+      # Без signing.local: ad-hoc и без Hardened Runtime. Ловит поломку project.yml —
+      # CLI должен лечь в Contents/Helpers, whisper.framework — в Contents/Frameworks.
+      - name: Сборка Release
+        run: make release
+
+      # Запуск CLI из бандла проверяет rpath и то, что dyld находит whisper.framework.
+      - name: CLI из бандла
+        run: build/Build/Products/Release/Earmark.app/Contents/Helpers/earmark help

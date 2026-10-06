@@ -87,3 +87,19 @@ clean:
 
 run: build
 	open "$(APP)"
+
+.PHONY: install-skill
+
+# Скилл для агентов (§9.5): симлинк на папку в репо, а не копия, — правка SKILL.md сразу видна
+# агентам. Каталоги агентов не создаём: нет ~/.claude — значит, нет и Claude Code.
+# ~/.agents/skills читают Codex и universal-агенты. ~/.codex/skills — запасной путь для старого
+# Codex и только когда общего каталога нет: иначе Codex покажет скилл дважды (так же решает
+# установщик `npx skills`). Чужую папку на месте ссылки не трогаем — её поставили иначе.
+install-skill:
+	@link() { \
+	  if [ -e "$$2" ] && [ ! -L "$$2" ]; then echo "skip: $$2 exists and is not a symlink"; \
+	  else ln -sfn "$$1" "$$2" && echo "$$2 -> $$1"; fi; }; \
+	src="$(CURDIR)/skills/earmark"; \
+	if [ -d "$(HOME)/.claude" ]; then mkdir -p "$(HOME)/.claude/skills"; link "$$src" "$(HOME)/.claude/skills/earmark"; fi; \
+	if [ -d "$(HOME)/.agents/skills" ]; then link "$$src" "$(HOME)/.agents/skills/earmark"; \
+	elif [ -d "$(HOME)/.codex/skills" ]; then link "$$src" "$(HOME)/.codex/skills/earmark"; fi

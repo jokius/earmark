@@ -36,7 +36,10 @@ enum TranscribeNowCommand {
         ).run(
             folder: job.folder.url, force: parsed.flag("force"),
             progress: { progress in
-                guard let line = try? JSONValue(encoding: progress) else { return }
+                // После SIGTERM в stdout ни строки: app при выходе ждёт воркер 2 с и закрывает pipe, а
+                // whisper зовёт progress(0) после VAD раньше abort-хука — запись убила бы воркер SIGPIPE'ом
+                // до того, как recordFailure вернёт meta, и попытка была бы засчитана.
+                guard !stop.isRaised, let line = try? JSONValue(encoding: progress) else { return }
                 output.stdout(Output.render(line, pretty: false))
             },
             shouldAbort: { stop.isRaised })

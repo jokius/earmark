@@ -59,6 +59,14 @@ struct MenuContent: View {
         if let recording = status.recording {
             return "Recording: \(recording.title) · \(elapsed(recording.elapsedSec))"
         }
+        if let queue = status.queue, let running = queue.running {
+            let progress = queue.percent.map { " · \(queue.channel ?? "") \($0)%" } ?? ""
+            let more = queue.pending > 0 ? " · \(queue.pending) queued" : ""
+            return "Transcribing \(running)\(progress)\(more)"
+        }
+        if let model = status.model, model.state == "downloading" {
+            return "Downloading model · \(Int((model.progress ?? 0) * 100))%"
+        }
         return "Idle"
     }
 

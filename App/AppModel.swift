@@ -40,7 +40,6 @@ final class AppModel {
             guard let self, !self.recordingWarnings.contains(warning) else { return }
             self.recordingWarnings.append(warning)
         }
-        Task { await session.recoverInterrupted() }  // Task 23 переносит за создание очереди
     }
 
     /// Ручная запись из меню, CLI и агента. Идемпотентна: идёт запись — вернёт её (§9.3). Отказ старта
@@ -74,6 +73,8 @@ final class AppModel {
     @ObservationIgnored private var scheduler: SchedulerDriver?
     @ObservationIgnored private var server: IPCServer?
     @ObservationIgnored private var socketProblem: String?
+    let provisioner = ModelProvisioner()
+    @ObservationIgnored private var queue: TranscriptionQueue?
     /// Два самотеста разом — два afplay и два tap: меню и `doctor --audio-test` не должны пересечься.
     @ObservationIgnored private var audioTestRunning = false
 
@@ -115,17 +116,35 @@ final class AppModel {
         let scheduler = SchedulerDriver(
             calendar: calendarService, session: session, config: { [weak self] in self?.config ?? Config() })
         self.scheduler = scheduler
-        // Колбэки сеанса задаются только здесь (D33): Task 23 дополнит onFinalized, onDiscarded сохранит.
-        session.onFinalized = { [weak scheduler] _, meta in scheduler?.recordingFinalized(meta) }
+        let queue = TranscriptionQueue(
+            store: { [weak self] in RecordingStore(root: (self?.config ?? Config()).recordingsDir) },
+            config: { [weak self] in self?.config ?? Config() },
+            isRecording: { [weak self] in self?.session.isRecording ?? false },
+            provisioner: provisioner, worker: Self.cliExecutable)
+        self.queue = queue
+        provisioner.onReady = { [weak queue] in queue?.requestScan() }
+        // Колбэки сеанса — только здесь (D33). onFinalized один на двоих: re-arm смотрит причину
+        // стопа, очередь ставит запись в работу.
+        session.onFinalized = { [weak scheduler, weak queue] _, meta in
+            scheduler?.recordingFinalized(meta)
+            queue?.requestScan()
+        }
         session.onDiscarded = { [weak scheduler] id, reason in
             scheduler?.recordingDiscarded(id: id, reason: reason)
         }
+        // Восстановленные при старте записи уходят в очередь, как только сведены (§4.3, D33).
+        Task { [weak self, weak queue] in
+            await self?.session.recoverInterrupted()
+            queue?.requestScan()
+        }
         scheduler.start()
+        queue.start()
     }
 
     func shutdown() {
         ticker?.cancel()
         server?.stop()
+        queue?.shutdown()
     }
 
     /// Поднимает IPC-сокет (§9.2). false — сокет уже обслуживает другой экземпляр: этот должен
@@ -168,7 +187,33 @@ final class AppModel {
             data.warnings.append("stale_calendars:" + stale.joined(separator: ","))
         }
         if let socketProblem { data.warnings.append("socket: \(socketProblem)") }
+        // Только stat, без sha256: дёшево и раз в секунду, зато status сразу видит модель,
+        // импортированную или докачанную CLI.
+        provisioner.refresh()
+        data.model = provisioner.info
+        if let queue {
+            data.queue = QueueInfo(
+                running: queue.runningID, pending: queue.pendingCount,
+                channel: queue.progress?.channel.rawValue, percent: queue.progress?.percent)
+            if data.state == "idle" && queue.runningID != nil { data.state = "transcribing" }
+        }
+        if let error = provisioner.lastError {
+            data.warnings.append("model_download_failed: \(error)")
+        } else if config.transcriptionEnabled && provisioner.info.state == "missing" {
+            data.warnings.append("model_missing")
+        }
         return data
+    }
+
+    // MARK: - транскрипция
+
+    func enqueueTranscription(id: String, force: Bool) throws(EarmarkError) -> JSONValue {
+        guard config.transcriptionEnabled else {
+            throw EarmarkError.unavailable(
+                "transcription is disabled: earmark config set transcription.enabled true")
+        }
+        guard let queue else { throw EarmarkError.unavailable("transcription queue is not running") }
+        return try queue.enqueue(id: id, force: force)
     }
 
     // MARK: - права

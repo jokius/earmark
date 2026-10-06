@@ -59,7 +59,8 @@ enum IPCHandlers {
             if params["all"]?.boolValue == true { return try model.resetConfig(nil) }
             return try model.resetConfig(try string(params, "key"))
         case IPCMethod.transcriptionEnqueue:
-            throw EarmarkError.unavailable("transcription queue is not available yet")
+            return try model.enqueueTranscription(
+                id: try string(params, "id"), force: params["force"]?.boolValue ?? false)
         case IPCMethod.doctor:
             return try encode(await model.doctor(audioTest: params["audio_test"]?.boolValue ?? false))
         case IPCMethod.permissionsRequest:

@@ -6,6 +6,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   # Новый пуш в ту же ветку отменяет предыдущий прогон: время macOS-раннеров дорогое,
   # держать очередь из устаревших сборок незачем.

@@ -4,13 +4,15 @@ SHELL     := /bin/bash
 # Без него сборка ad-hoc: работает, но TCC переспрашивает микрофон, системный звук и календари
 # после каждой пересборки.
 #
-# Ad-hoc собираем без Hardened Runtime: у ad-hoc подписи нет Team ID, и library validation
-# не пустила бы whisper.framework в CLI («different Team IDs», проверено на Release).
+# Hardened Runtime включаем только при подписи с Team ID: у ad-hoc подписи его нет, и library
+# validation не пустила бы whisper.framework в CLI («different Team IDs», проверено на Release).
+# Признак подписи — DEVELOPMENT_TEAM, а не CODE_SIGN_IDENTITY: identity может прийти из окружения
+# ("-"), а runtime без Team ID невозможен. В project.yml дефолт NO.
 #
 # Team намеренно не в project.yml: репозиторий публичный, и с чужим DEVELOPMENT_TEAM сборка
 # у постороннего упала бы на «No account for team».
 -include signing.local
-SIGN_ARGS  = $(if $(CODE_SIGN_IDENTITY),CODE_SIGN_IDENTITY="$(CODE_SIGN_IDENTITY)" DEVELOPMENT_TEAM="$(DEVELOPMENT_TEAM)" $(if $(CODE_SIGN_STYLE),CODE_SIGN_STYLE="$(CODE_SIGN_STYLE)",),ENABLE_HARDENED_RUNTIME=NO)
+SIGN_ARGS  = $(if $(DEVELOPMENT_TEAM),CODE_SIGN_IDENTITY="$(or $(CODE_SIGN_IDENTITY),Apple Development)" DEVELOPMENT_TEAM="$(DEVELOPMENT_TEAM)" $(if $(CODE_SIGN_STYLE),CODE_SIGN_STYLE="$(CODE_SIGN_STYLE)",) ENABLE_HARDENED_RUNTIME=YES,)
 
 PROJECT   := Earmark.xcodeproj
 SCHEME    := Earmark
@@ -48,6 +50,8 @@ install: build
 	cp -R "$(APP)" /Applications/
 	codesign --verify --deep --strict "$(INSTALLED)" && echo "signature valid"
 	mkdir -p "$(dir $(CLI_LINK))"
+	@if [ -e "$(CLI_LINK)" ] && [ "$$(readlink "$(CLI_LINK)")" != "$(INSTALLED)/Contents/Helpers/earmark" ]; then \
+	  echo "refusing to replace $(CLI_LINK): it is not earmark's symlink"; exit 1; fi
 	ln -sf "$(INSTALLED)/Contents/Helpers/earmark" "$(CLI_LINK)"
 	"$(CLI_LINK)" help > /dev/null && echo "CLI runs"
 	@echo "installed: $(INSTALLED), CLI: $(CLI_LINK)"

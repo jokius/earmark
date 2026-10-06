@@ -20,7 +20,11 @@ settings:
     SWIFT_STRICT_CONCURRENCY: complete
     MARKETING_VERSION: "0.1.0"
     CURRENT_PROJECT_VERSION: "1"
-    ENABLE_HARDENED_RUNTIME: YES
+    # Hardened Runtime включает только Makefile, и только при подписи с Team ID (signing.local):
+    # у ad-hoc подписи Team ID нет, и library validation не пустила бы whisper.framework в CLI
+    # («different Team IDs», exit 134). Дефолт NO — поэтому сборка в обход make (голый xcodebuild,
+    # Archive в Xcode) не даёт мёртвый CLI.
+    ENABLE_HARDENED_RUNTIME: NO
     # По умолчанию ad-hoc, чтобы проект собирался у любого без настройки. Своя identity —
     # в signing.local (см. signing.local.example): ad-hoc меняет cdhash при каждой сборке,
     # и TCC заново спрашивает микрофон, системный звук и календари.

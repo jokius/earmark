@@ -15,6 +15,9 @@ struct MenuContent: View {
         }
         Divider()
         Text(Self.statusLine(model.snapshot))
+        if let next = model.snapshot.next {
+            Text("Next: \(next.start.formatted(date: .omitted, time: .shortened)) \(next.title)")
+        }
         ForEach(model.snapshot.warnings, id: \.self) { warning in
             Text("Warning: \(warning)")
         }
@@ -35,6 +38,14 @@ struct MenuContent: View {
             Button("Run Audio Self-Test (plays a short quiet tone)") {
                 Task { _ = try? await model.audioTest() }
             }
+            Divider()
+            ForEach(model.calendarsList(), id: \.id) { item in
+                Toggle(
+                    "\(item.title) — \(item.account)",
+                    isOn: Binding(
+                        get: { item.enabled }, set: { model.debugSetCalendar(item.id, enabled: $0) }))
+            }
+            Button("Reset Enabled Calendars") { _ = try? model.resetConfig("calendars") }
         }
         #endif
 

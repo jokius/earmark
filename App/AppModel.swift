@@ -26,39 +26,43 @@ final class AppModel {
     @ObservationIgnored private(set) lazy var session = RecordingSession(
         store: { [weak self] in RecordingStore(root: (self?.config ?? Config()).recordingsDir) },
         config: { [weak self] in self?.config ?? Config() })
-    /// Временно, до Task 16: монитор созвона на app один, и Task 16 переносит его в SchedulerDriver.
-    @ObservationIgnored private lazy var callMonitor = CallActivityMonitor(levels: session.levels)
     /// Предупреждения записи (`capture_failed:…`, `far_end_digital_silence`, `start_failed:…`,
     /// `finalize_failed:…`) — в status.warnings. Сбрасываются на каждом старте записи.
     private(set) var recordingWarnings: [String] = []
 
     var isRecording: Bool { session.isRecording }
 
-    /// Запись и детект созвона. Последняя строка start(): AppDelegate зовёт его только после проверки
-    /// TestEnvironment, так что под тестами ни захвата, ни восстановления нет.
+    /// Запись. Зовётся из start(): AppDelegate зовёт его только после проверки TestEnvironment, так что
+    /// под тестами ни захвата, ни восстановления нет. Монитор созвона держит SchedulerDriver (D28).
     func startRecordingServices() {
         session.onStarted = { [weak self] in self?.recordingWarnings = [] }
         session.onWarning = { [weak self] warning in
             guard let self, !self.recordingWarnings.contains(warning) else { return }
             self.recordingWarnings.append(warning)
         }
-        callMonitor.start { [weak self] sample in self?.session.ingest(sample) }  // убирает Task 16
         Task { await session.recoverInterrupted() }  // Task 23 переносит за создание очереди
     }
 
-    /// Ручная запись из меню, CLI и агента. Идемпотентна: идёт запись — вернёт её. Отказ старта виден в
-    /// status.warnings (`start_failed:…`), а не только в логе: из меню иначе «ничего не произошло».
+    /// Ручная запись из меню, CLI и агента. Идемпотентна: идёт запись — вернёт её (§9.3). Отказ старта
+    /// виден в status.warnings (`start_failed:…`), а не только в логе: из меню иначе «ничего не произошло».
     func startManual(title: String?) throws(EarmarkError) -> CurrentRecordingInfo {
         if let current = session.current { return current }
+        // Ровно одно текущее событие включённого календаря — запись уходит в его папку с его
+        // метаданными (trigger остаётся manual) и делает его handled (§5).
+        let meeting = scheduler?.currentMeeting()
         let request = RecordingSession.StartRequest(
-            trigger: .manual, title: title ?? "Manual recording", meeting: nil, calendarFolder: nil)
+            trigger: .manual, title: title ?? meeting?.title ?? "Manual recording", meeting: meeting,
+            calendarFolder: meeting.flatMap { scheduler?.folderName(for: $0.calendar) })
         recordingWarnings = []
+        let info: CurrentRecordingInfo
         do throws(EarmarkError) {
-            return try session.start(request)
+            info = try session.start(request)
         } catch {
             recordingWarnings = ["start_failed:\(error.message)"]
             throw error
         }
+        if let meeting { scheduler?.attachManual(recordingId: info.id, to: meeting) }
+        return info
     }
 
     /// Стоп из меню, CLI и агента; ответ — после финализации. nil — писать было нечего или запись отброшена.
@@ -66,6 +70,8 @@ final class AppModel {
         try await session.stop(reason: .manual)
     }
     let permissions = Permissions()
+    let calendarService = CalendarService()
+    @ObservationIgnored private var scheduler: SchedulerDriver?
 
     /// status() начинает с него, а каждая задача, которой есть что сказать, дописывает своё
     /// перед `return data`. Версия — EarmarkVersion (Task 1): одна на app, CLI и meta.json.
@@ -102,6 +108,15 @@ final class AppModel {
             }
         }
         startRecordingServices()
+        let scheduler = SchedulerDriver(
+            calendar: calendarService, session: session, config: { [weak self] in self?.config ?? Config() })
+        self.scheduler = scheduler
+        // Колбэки сеанса задаются только здесь (D33): Task 23 дополнит onFinalized, onDiscarded сохранит.
+        session.onFinalized = { [weak scheduler] _, meta in scheduler?.recordingFinalized(meta) }
+        session.onDiscarded = { [weak scheduler] id, reason in
+            scheduler?.recordingDiscarded(id: id, reason: reason)
+        }
+        scheduler.start()
     }
 
     func shutdown() {
@@ -119,6 +134,10 @@ final class AppModel {
         }
         data.warnings += recordingWarnings
         data.permissions = permissions.current()
+        data.next = scheduler?.next
+        if let stale = scheduler?.staleCalendarIDs, !stale.isEmpty {
+            data.warnings.append("stale_calendars:" + stale.joined(separator: ","))
+        }
         return data
     }
 
@@ -146,6 +165,39 @@ final class AppModel {
         #endif
         return session.isRecording || snapshot.state == "recording"
     }
+
+    // MARK: - календари
+
+    func calendarsList() -> [CalendarListItem] {
+        let all = calendarService.calendars()
+        let enabled = Set(config.calendars)
+        return all.map { calendar in
+            CalendarListItem(
+                id: calendar.id, title: calendar.title, account: calendar.account,
+                enabled: enabled.contains(calendar.id),
+                folder: RecordingStore.calendarFolderName(
+                    for: calendar, override: config.folderOverride(forCalendar: calendar.id),
+                    allCalendars: all))
+        }
+    }
+
+    func upcoming(hours: Int) -> [UpcomingItem] {
+        scheduler?.upcoming(hours: hours) ?? []
+    }
+
+    #if DEBUG
+    /// Переключатель календаря из Debug-меню: проверка расписания не ждёт IPC и CLI.
+    func debugSetCalendar(_ id: String, enabled: Bool) {
+        var ids = config.calendars.filter { $0 != id }
+        if enabled { ids.append(id) }
+        let raw = (try? JSONEncoder().encode(ids)).flatMap { String(bytes: $0, encoding: .utf8) } ?? "[]"
+        do {
+            _ = try setConfig("calendars", raw: raw)
+        } catch {
+            logger.error("debug calendars: \(error.message, privacy: .public)")
+        }
+    }
+    #endif
 
     // MARK: - конфиг
 

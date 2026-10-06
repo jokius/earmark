@@ -96,6 +96,21 @@ final class RecordingSession {
     /// жив второй: созвон без одного канала лучше, чем без записи. Не поднялись оба — ошибка.
     func start(_ request: StartRequest) throws(EarmarkError) -> CurrentRecordingInfo {
         if let current { return current }
+        // Пока на запрос права не ответили, первый старт tap висит на системном диалоге и держит main
+        // actor (S1) — вместе с меню, IPC и тиками. Сюда сходятся меню, IPC и календарь; запрос —
+        // дело `permissions request`.
+        var unanswered: [String] = []
+        if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
+            unanswered.append("Microphone")
+        }
+        if TCCPreflight.audioCapture() == .notDetermined {
+            unanswered.append("System Audio Recording")
+        }
+        guard unanswered.isEmpty else {
+            throw .permissionDenied(
+                unanswered.joined(separator: " and ")
+                    + " access has not been granted yet: run earmark permissions request")
+        }
         // Оба трека в одном формате: клиент — Float32 48 kHz mono, файл — Int16 (CAFWriter). Рекордеры
         // приводят к нему свои устройства.
         guard let format = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1) else {
@@ -212,15 +227,16 @@ final class RecordingSession {
         if case .stop(let reason) = decision { stopInBackground(reason: reason) }
     }
 
-    /// При старте app: папки с manifest, чей процесс мёртв, — свести и отдать в очередь.
+    /// При старте app: папки с manifest, кроме идущей записи, — свести и отдать в очередь.
     func recoverInterrupted() async {
         let store = store()
         let keepRawTracks = config().keepRawTracks
-        let own = getpid()
         let folders: [RecordingFolder]
         do {
-            // Свой pid — тоже «мёртв»: после перезагрузки новый экземпляр нередко получает pid старого.
-            folders = try store.interrupted { pid in pid != own && kill(pid, 0) == 0 }
+            // По pid живость не проверяем: второй экземпляр выходит раньше start() (single instance),
+            // значит, писатель любого manifest, кроме своей записи, мёртв. А pid старого писателя после
+            // перезагрузки нередко занят чужим живым процессом — такая запись не восстановилась бы никогда.
+            folders = try store.interrupted { _ in false }
         } catch {
             Self.log.error("cannot list interrupted recordings: \(error, privacy: .public)")
             return

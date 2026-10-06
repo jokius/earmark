@@ -35,6 +35,8 @@ final class SchedulerDriver {
     private var sleepObservers: [any NSObjectProtocol] = []
     private var monitor: CallActivityMonitor?
     private let logger = Logger(subsystem: EarmarkPaths.bundleID, category: "scheduler")
+    /// `start_failed:…` и `finalize_failed:…` для status.warnings — тот же канал, что у сеанса.
+    var onWarning: ((String) -> Void)?
 
     init(
         calendar: CalendarService, session: RecordingSession, config: @escaping () -> Config,
@@ -114,7 +116,12 @@ final class SchedulerDriver {
             // так что поздний onFinalized A только уберёт A из eventKeys.
             let finishing = session.stopNow(reason: .nextEvent)
             startRecording(meeting, now: now)
-            _ = try? await finishing?.value
+            do {
+                _ = try await finishing?.value
+            } catch {
+                // Уже после старта B: его onStarted предупреждение не сотрёт.
+                onWarning?("finalize_failed:\(error.localizedDescription)")
+            }
         }
     }
 
@@ -236,6 +243,7 @@ final class SchedulerDriver {
         } catch {
             lastFailure = (meeting.key, now)
             logger.error("auto start failed: \(error.message, privacy: .public)")
+            onWarning?("start_failed:\(error.message)")
         }
     }
 

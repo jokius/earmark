@@ -49,8 +49,10 @@ public enum CommandTable {
             options: [value("--title", "Recording title")],
             needsApp: true, mcpTool: "start_recording", readOnly: false),
         CommandSpec(
-            path: ["stop"], summary: "Stop the current recording; replies after the audio is finalized",
-            needsApp: true, mcpTool: "stop_recording", readOnly: false),
+            path: ["stop"],
+            summary: "Stop the current recording; replies after the audio is finalized; "
+                + "never launches the app, returns null when nothing is recording",
+            needsApp: false, mcpTool: "stop_recording", readOnly: false),
         CommandSpec(
             path: ["upcoming"], summary: "Calendar events that will be recorded automatically",
             options: [value("--hours", "Look-ahead window in hours (integer, default 24)")],

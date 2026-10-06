@@ -127,7 +127,7 @@ to stderr as `{"schema_version":1,"error":{"code":"…","message":"…","exit_co
 |---|---|
 | `earmark status` | State, current recording, next auto-recording, permissions, queue, warnings. Never launches the app: prints `"app_running": false` instead |
 | `earmark start [--title T]` | Start a manual recording. Idempotent: returns the running recording if there is one |
-| `earmark stop` | Stop and finalize; answers once `audio.m4a` is written |
+| `earmark stop` | Stop and finalize; answers once `audio.m4a` is written. Never launches the app: with the app quit nothing is recording, so it answers `null` |
 | `earmark upcoming [--hours 24]` | Events that will be recorded |
 | `earmark calendars` | Calendars with `enabled`, account and folder |
 | `earmark calendars enable <id>`, `earmark calendars disable <id>` | Turn auto-recording on or off for a calendar |
@@ -144,7 +144,7 @@ to stderr as `{"schema_version":1,"error":{"code":"…","message":"…","exit_co
 | `earmark mcp` | stdio MCP server |
 | `earmark help [--json]` | The command table |
 
-Commands that need the app — start, stop, upcoming, calendars, `config set` and `config reset`,
+Commands that need the app — start, upcoming, calendars, `config set` and `config reset`,
 `transcribe` without `--now`, doctor and `permissions request` — launch it with
 `open -g -b com.konayre.earmark` when it is not running and wait up to 5 seconds. Everything else
 reads plain files and works without the app.

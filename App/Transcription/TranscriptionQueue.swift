@@ -116,7 +116,9 @@ final class TranscriptionQueue {
                 "recording \(id) failed transcription (\(meta.transcription.error ?? "no details")); "
                     + "pass force to retry")
         }
-        if running?.id == id { return Self.queued(position: 0) }
+        // Уже идёт — это та же задача. Кроме --force поверх обычного прогона: он встаёт в очередь после
+        // него, иначе молча потерялся бы, а каналы остались бы старыми.
+        if let running, running.id == id, running.force || !force { return Self.queued(position: 0) }
         if let index = requests.firstIndex(where: { $0.id == id }) {
             requests[index].force = requests[index].force || force
         } else {
@@ -297,8 +299,10 @@ final class TranscriptionQueue {
             logger.notice("transcribed \(id, privacy: .public)")
         case (.exit, 75):
             // Lock держит другой воркер (например, `earmark transcribe --now` руками) или воркер
-            // прервали не мы (SIGINT, SIGHUP): meta он вернул сам.
+            // прервали не мы (SIGINT, SIGHUP): meta он вернул сам. Явный --force, как при вытеснении,
+            // ждёт паузу и повторяется.
             cooldown[id] = later
+            if job.force { requests.insert(Request(id: id, force: true), at: 0) }
         case (.exit, 69):
             // Модели нет или не читается config.json — environmental, попытку воркер не засчитал
             // (D36). Пауза — на случай, если файл есть, но не грузится: иначе запуск шёл бы каждую секунду.

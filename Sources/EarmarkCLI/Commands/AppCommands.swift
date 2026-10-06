@@ -32,10 +32,18 @@ enum AppCommands {
         return try await send(IPCMethod.recordingStart, .object(params), context)
     }
 
+    /// stop тоже не поднимает app: в закрытом app ничего не пишется — ответ null, как у app без записи.
+    /// Поднятый app ещё и начал бы поздней авто-записью идущую встречу: «стоп» стартовал бы запись.
     static func stop(
         _ parsed: ParsedCommand, _ context: CLIContext
     ) async throws(EarmarkError) -> JSONValue {
-        try await send(IPCMethod.recordingStop, .object([:]), context, timeout: longTimeout)
+        do {
+            return try await context.ipc.call(
+                IPCMethod.recordingStop, params: .object([:]), autoLaunch: false, timeout: longTimeout)
+        } catch {
+            guard error.exitCode == ExitCode.appNotRunning.rawValue else { throw error }
+            return .null
+        }
     }
 
     static func upcoming(
@@ -150,7 +158,7 @@ enum AppCommands {
             IPCMethod.configSet, .object(["key": .string("calendars"), "value": .string(value)]), context)
     }
 
-    /// Все команды app, кроме status, поднимают app, если сокет мёртв (§9.3).
+    /// Все команды app, кроме status и stop, поднимают app, если сокет мёртв (§9.3).
     private static func send(
         _ method: String, _ params: JSONValue, _ context: CLIContext, timeout: TimeInterval = defaultTimeout
     ) async throws(EarmarkError) -> JSONValue {

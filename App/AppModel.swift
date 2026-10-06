@@ -36,10 +36,13 @@ final class AppModel {
     /// под тестами ни захвата, ни восстановления нет. Монитор созвона держит SchedulerDriver (D28).
     func startRecordingServices() {
         session.onStarted = { [weak self] in self?.recordingWarnings = [] }
-        session.onWarning = { [weak self] warning in
-            guard let self, !self.recordingWarnings.contains(warning) else { return }
-            self.recordingWarnings.append(warning)
-        }
+        session.onWarning = { [weak self] in self?.addRecordingWarning($0) }
+    }
+
+    /// Канал предупреждений записи один на сеанс и календарь; повтор того же текста не дублируется.
+    private func addRecordingWarning(_ warning: String) {
+        guard !recordingWarnings.contains(warning) else { return }
+        recordingWarnings.append(warning)
     }
 
     /// Ручная запись из меню, CLI и агента. Идемпотентна: идёт запись — вернёт её (§9.3). Отказ старта
@@ -115,6 +118,8 @@ final class AppModel {
         startRecordingServices()
         let scheduler = SchedulerDriver(
             calendar: calendarService, session: session, config: { [weak self] in self?.config ?? Config() })
+        // Отказ авто-старта и сбой сведения A при переключении (next_event) иначе видны только в логе.
+        scheduler.onWarning = { [weak self] in self?.addRecordingWarning($0) }
         self.scheduler = scheduler
         let queue = TranscriptionQueue(
             store: { [weak self] in RecordingStore(root: (self?.config ?? Config()).recordingsDir) },
@@ -325,7 +330,15 @@ final class AppModel {
     /// Сначала побочные эффекты, которые могут не получиться, потом файл: иначе config.json
     /// обещал бы каталог или login item, которых в системе нет.
     private func apply(_ next: Config) throws(EarmarkError) {
-        if next.recordingsDir != config.recordingsDir { try ensureRecordingsDir(next.recordingsDir) }
+        if next.recordingsDir != config.recordingsDir {
+            // Идущая запись осталась бы в старом каталоге: ни очередь, ни recover, ни `recordings`
+            // её больше не увидят.
+            guard !session.isRecording else {
+                throw EarmarkError.busy(
+                    "recordings_dir cannot change during a recording: stop the recording first")
+            }
+            try ensureRecordingsDir(next.recordingsDir)
+        }
         if next.launchAtLogin != config.launchAtLogin {
             try setLaunchAtLogin(next.launchAtLogin)
             loginItemProblem = nil

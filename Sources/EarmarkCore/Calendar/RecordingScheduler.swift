@@ -109,9 +109,11 @@ public enum RecordingScheduler {
 
     /// Что будет записано в ближайшие `hours` часов: `end > now` и `start < now + hours`,
     /// `recordAt = start − lead(календаря)`. Уже идущие события тоже в списке: поздний старт их запишет.
+    /// auto_record выключен — пусто: записано не будет ничего (`decide` тоже молчит).
     public static func upcoming(
         now: Date, hours: Int, meetings: [Meeting], config: Config
     ) -> [UpcomingItem] {
+        guard config.autoRecord else { return [] }
         let order = config.calendars
         let horizon = now.addingTimeInterval(TimeInterval(hours) * 3600)
         return dedupe(meetings, calendarOrder: order)

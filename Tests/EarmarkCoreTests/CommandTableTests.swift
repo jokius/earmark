@@ -125,12 +125,13 @@ struct CommandTableTests {
         #expect(keys.first { $0["key"] == "lead_seconds" }?["range"] == [0, 3600])
     }
 
-    @Test("поднимать app нужно ровно командам из спеки §9.3; status не поднимает никогда")
+    /// stop — отступление от §9.3: поднятый app начал бы поздней авто-записью идущую встречу.
+    @Test("поднимать app нужно ровно командам из спеки §9.3; status и stop не поднимают никогда")
     func needsApp() {
         let needs = Set(CommandTable.all.filter(\.needsApp).map { $0.path.joined(separator: " ") })
         #expect(
             needs == [
-                "start", "stop", "upcoming", "calendars", "calendars enable", "calendars disable",
+                "start", "upcoming", "calendars", "calendars enable", "calendars disable",
                 "transcribe",
                 "config set", "config reset", "doctor", "permissions request",
             ])

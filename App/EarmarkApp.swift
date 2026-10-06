@@ -41,6 +41,7 @@ enum MenuIcon {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let model = AppModel()
     private let logger = Logger(subsystem: EarmarkPaths.bundleID, category: "app")
+    private var terminateSignal: (any DispatchSourceSignal)?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // App, поднятый хостом тестов, не должен трогать конфиг, login item и тем более запись.
@@ -48,6 +49,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             logger.notice("test environment: services are not started")
             return
         }
+        // SIGTERM (`kill`, pkill в make install/uninstall) по умолчанию убивает процесс мимо
+        // applicationWillTerminate: CAF записи не закрыты, а воркер транскрипции, которого никто
+        // не остановил, тратит одну из трёх попыток. Переводим сигнал в обычный выход.
+        let source = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        source.setEventHandler { MainActor.assumeIsolated { NSApp.terminate(nil) } }
+        // Источник раньше SIG_IGN, как у воркера: сигнал в этом окне просто убьёт процесс, а не потеряется.
+        source.resume()
+        signal(SIGTERM, SIG_IGN)
+        terminateSignal = source
         if let other = Self.otherInstance() {
             logger.notice("another instance is running (pid \(other.processIdentifier)), exiting")
             NSApp.terminate(nil)

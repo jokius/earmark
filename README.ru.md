@@ -126,7 +126,7 @@ DEVELOPMENT_TEAM = <поле OU сертификата>
 |---|---|
 | `earmark status` | Состояние, текущая запись, ближайшая авто-запись, права, очередь, предупреждения. App не поднимает: вместо этого `"app_running": false` |
 | `earmark start [--title T]` | Начать ручную запись. Идемпотентно: если запись идёт, вернёт её |
-| `earmark stop` | Остановить и свести; отвечает, когда `audio.m4a` уже записан |
+| `earmark stop` | Остановить и свести; отвечает, когда `audio.m4a` уже записан. App не поднимает: в закрытом app ничего не пишется, ответ — `null` |
 | `earmark upcoming [--hours 24]` | События, которые будут записаны |
 | `earmark calendars` | Календари с `enabled`, аккаунтом и папкой |
 | `earmark calendars enable <id>`, `earmark calendars disable <id>` | Включить или выключить авто-запись календаря |
@@ -143,7 +143,7 @@ DEVELOPMENT_TEAM = <поле OU сертификата>
 | `earmark mcp` | stdio MCP-сервер |
 | `earmark help [--json]` | Таблица команд |
 
-Командам, которым нужен app, — start, stop, upcoming, calendars, `config set` и `config reset`,
+Командам, которым нужен app, — start, upcoming, calendars, `config set` и `config reset`,
 `transcribe` без `--now`, doctor и `permissions request` — CLI сам поднимает его через
 `open -g -b com.konayre.earmark` и ждёт до 5 секунд. Остальные читают обычные файлы и работают
 без app.

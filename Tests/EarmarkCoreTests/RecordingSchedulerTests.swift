@@ -334,5 +334,10 @@ struct SchedulerQueriesTests {
                     eventId: "Running@cal-work", title: "Running",
                     calendar: CalendarRef(id: "cal-work", title: "Work"),
                     start: at("09:30:00"), end: at("10:30:00"), recordAt: at("09:29:00")))
+        // auto_record выключен — записано не будет ничего, и обещать нечего (за ним и status.next).
+        #expect(
+            RecordingScheduler.upcoming(
+                now: at("10:00:00"), hours: 2, meetings: meetings, config: makeConfig(autoRecord: false)
+            ).isEmpty)
     }
 }

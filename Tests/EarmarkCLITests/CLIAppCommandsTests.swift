@@ -19,6 +19,18 @@ struct CLIAppCommandsTests {
         #expect(!harness.context().ipc.isAppRunning())
     }
 
+    /// Поднятый app начал бы поздней авто-записью идущую встречу — «стоп» стартовал бы запись.
+    @Test("stop без app: data null, exit 0, app не поднимается")
+    func stopWithoutApp() async throws {
+        let harness = try CLIHarness()
+        let result = try await harness.run(["stop"])
+        #expect(result.code == 0)
+        #expect(result.out?["command"] == .string("stop"))
+        #expect(result.data == .null)
+        #expect(result.err == nil)
+        #expect(harness.launchCount == 0)
+    }
+
     @Test("status с app: data от app проходит как есть")
     func statusWithApp() async throws {
         let harness = try CLIHarness()

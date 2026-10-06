@@ -40,12 +40,18 @@ build: gen
 release:
 	$(MAKE) build CONFIG=Release
 
+# SIGTERM — штатный выход app: очередь ждёт воркер транскрипции до 2 с, чтобы попытка не сгорела.
+# Не вышел за 5 с (завис) — SIGKILL: rm -rf под живым процессом оставил бы старый бинарь в памяти.
+STOP_APP = pkill -x Earmark 2>/dev/null || true; \
+	for i in $$(seq 25); do pgrep -x Earmark >/dev/null || break; sleep 0.2; done; \
+	pkill -9 -x Earmark 2>/dev/null || true
+
 # Release в /Applications: оттуда работает login item (SMAppService), а TCC видит app,
 # запущенный через LaunchServices. `make install CONFIG=Debug` ставит Debug — с пробами спайков.
 # Последний шаг запускает CLI через symlink: так сразу видны и rpath, и library validation.
 install: CONFIG := Release
 install: build
-	pkill -x Earmark 2>/dev/null || true; sleep 1
+	$(STOP_APP)
 	rm -rf "$(INSTALLED)"
 	cp -R "$(APP)" /Applications/
 	codesign --verify --deep --strict "$(INSTALLED)" && echo "signature valid"
@@ -59,7 +65,7 @@ install: build
 
 # Symlink удаляем, только если он наш: чужой earmark в ~/.local/bin не трогаем.
 uninstall:
-	pkill -x Earmark 2>/dev/null || true
+	$(STOP_APP)
 	rm -rf "$(INSTALLED)"
 	if [ "$$(readlink "$(CLI_LINK)")" = "$(INSTALLED)/Contents/Helpers/earmark" ]; then rm -f "$(CLI_LINK)"; fi
 

@@ -4,7 +4,7 @@ import Foundation
 public struct StopConfig: Equatable, Sendable {
     public var callEndSeconds: Int  // 60
     public var afterEndSeconds: Int  // 120
-    public var farEndQuietSeconds: Int  // 60
+    public var endQuietSeconds: Int  // 60
     public var silenceMinutes: Int  // 10
     public var joinGraceMinutes: Int  // 10
     public var maxMinutes: Int  // 300
@@ -62,7 +62,7 @@ public struct Config: Equatable, Sendable {
         StopConfig(
             callEndSeconds: int("stop.call_end_seconds"),
             afterEndSeconds: int("stop.after_end_seconds"),
-            farEndQuietSeconds: int("stop.far_end_quiet_seconds"),
+            endQuietSeconds: int("stop.end_quiet_seconds"),
             silenceMinutes: int("stop.silence_minutes"),
             joinGraceMinutes: int("stop.join_grace_minutes"),
             maxMinutes: int("stop.max_minutes"),

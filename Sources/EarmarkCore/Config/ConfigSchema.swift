@@ -22,7 +22,9 @@ public enum ConfigSchema {
         spec(
             "stop.after_end_seconds", .int, .int(120), "Grace after the event end before event_over", 0...7200
         ),
-        spec("stop.far_end_quiet_seconds", .int, .int(60), "Far end quiet this long after the end", 5...3600),
+        spec(
+            "stop.end_quiet_seconds", .int, .int(60),
+            "Seconds both channels must be quiet after the event end before event_over", 5...3600),
         spec("stop.silence_minutes", .int, .int(10), "Stop when both channels are silent this long", 1...240),
         spec(
             "stop.join_grace_minutes", .int, .int(10), "Stop if no call started this long after start",

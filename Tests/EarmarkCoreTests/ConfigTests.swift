@@ -20,7 +20,7 @@ struct ConfigTests {
         #expect(
             config.stop
                 == StopConfig(
-                    callEndSeconds: 60, afterEndSeconds: 120, farEndQuietSeconds: 60, silenceMinutes: 10,
+                    callEndSeconds: 60, afterEndSeconds: 120, endQuietSeconds: 60, silenceMinutes: 10,
                     joinGraceMinutes: 10, maxMinutes: 300, minKeepSeconds: 45))
         #expect(StopConfig.defaults == config.stop)
         #expect(!config.keepRawTracks)
@@ -59,6 +59,16 @@ struct ConfigTests {
         #expect(throws: ConfigError.self) { try config.set("calendar.CAL-1.folder", value: .string("../x")) }
         #expect(throws: ConfigError.unknownKey("nope")) { try config.set("nope", value: .bool(true)) }
         #expect(config == Config())
+    }
+
+    @Test("stop.end_quiet_seconds попадает в StopConfig; старое имя far_end_quiet_seconds — unknownKey")
+    func endQuietKey() throws {
+        var config = Config()
+        try config.set("stop.end_quiet_seconds", raw: "90")
+        #expect(config.stop.endQuietSeconds == 90)
+        #expect(throws: ConfigError.unknownKey("stop.far_end_quiet_seconds")) {
+            try config.set("stop.far_end_quiet_seconds", raw: "90")
+        }
     }
 
     @Test("reset возвращает дефолт, resetAll — всё; неизвестный ключ — unknownKey")

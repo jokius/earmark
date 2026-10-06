@@ -47,6 +47,12 @@ enum AudioProcessList {
         return status == noErr && object != kAudioObjectUnknown ? object : nil
     }
 
+    /// Текущий default input; nil, если входов нет вовсе.
+    static func defaultInputDevice() -> AudioObjectID? {
+        uint32(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyDefaultInputDevice)
+            .flatMap { $0 == kAudioObjectUnknown ? nil : $0 }
+    }
+
     private static func objects(
         _ object: AudioObjectID, _ selector: AudioObjectPropertySelector,
         scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal

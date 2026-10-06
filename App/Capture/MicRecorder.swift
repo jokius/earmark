@@ -1,0 +1,354 @@
+// Copyright (c) 2026 Andrew Jones
+// Copyright (c) 2026 Samat Galimov
+// SPDX-License-Identifier: MIT
+// Портировано из gsamat/amanu@fbccc13: Sources/amanu/Audio/MicRecorder.swift (MIT) — только ядро
+// рестартов (start L283-311, слушатель default input L687-720, рестарт L725-823, паддинг L855-873):
+// без voice processing, выбора микрофона звонилки и storm-guard.
+@preconcurrency import AVFoundation
+import Accelerate
+import CoreAudio
+import EarmarkAudio
+import EarmarkCore
+import Foundation
+import Synchronization
+import os
+
+/// Микрофон (я): AVAudioEngine.inputNode → CAFWriter (синхронно, со своей очереди).
+///
+/// Voice processing (VPIO) не включаем никогда: он приглушает чужой звук, может заглушить микрофон в
+/// Teams и Chrome и дестабилизирует aggregate с tap.
+///
+/// Формат входа не фиксирован (BT-гарнитура в HFP — 1 ch 16 kHz, замер S1), а формат файла задан
+/// первой записью: каждый буфер приводим к `writer.clientFormat`.
+///
+/// Перезапуск — по AVAudioEngineConfigurationChange (звонилка перенастроила устройство, AirPods сменили
+/// профиль) и по смене default input: на неё AVAudioEngine не реагирует вовсе, остаётся на старом
+/// устройстве и ничего не постит (замер amanu). Дыру после рестарта закрывает тишиной первый буфер
+/// нового движка — только он знает, сколько устройство поднималось.
+final class MicRecorder: @unchecked Sendable {
+    /// Пачка уведомлений при переключении устройства — один рестарт.
+    static let restartDebounce: TimeInterval = 0.5
+    static let retryDelay: TimeInterval = 2
+
+    private static let log = Logger(subsystem: EarmarkPaths.bundleID, category: "mic")
+
+    private let control = DispatchQueue(label: "com.konayre.earmark.mic")
+    private let writeQueue = DispatchQueue(label: "com.konayre.earmark.mic.write", qos: .userInitiated)
+    private let level = Atomic<Float>(0)
+    private let firstHostTime = Atomic<UInt64>(0)
+    /// Host time последнего вызова тапа: живой ли движок, который уверяет, что работает.
+    private let lastTapHostTime = Atomic<UInt64>(0)
+    private let running = Atomic<Bool>(false)
+    private let ticksPerSecond = AudioGetHostClockFrequency()
+
+    // Только на `control`.
+    private var writer: CAFWriter?
+    private var engine: AVAudioEngine?
+    /// Устройство и формат, на которых поднят `engine`.
+    private var device: AudioObjectID?
+    private var inputFormat: AVAudioFormat?
+    private var generation = 0
+    private var configObserver: (any NSObjectProtocol)?
+    private var defaultInputListener: AudioObjectPropertyListenerBlock?
+    private var pendingRestart: DispatchWorkItem?
+
+    // Только на `writeQueue`.
+    /// Открыт от start до stop: буфер, который тап отдал уже после stop, в закрытый writer не идёт.
+    private var accepting = false
+    private var writtenGeneration = 0
+    private var windowSum: Float = 0
+    private var windowFrames: Int = 0
+    private var reportedWriteError = false
+
+    /// RMS последней полной секунды, 0…1. Пока рекордер не пишет — 0: монитор созвона на простое
+    /// должен видеть тишину, а не уровень прошлой записи. Буферов нет дольше 2 с (рестарт движка,
+    /// устройство ещё не поднялось) — тоже 0, а не застывший уровень последней живой секунды.
+    var levelRMS: Float {
+        guard isRunning else { return 0 }
+        let last = lastTapHostTime.load(ordering: .relaxed)
+        let now = AudioGetCurrentHostTime()
+        guard now >= last, Double(now - last) < 2 * ticksPerSecond else { return 0 }
+        return level.load(ordering: .relaxed)
+    }
+    /// Host time первого сэмпла трека; nil до первого буфера.
+    var startHostTime: UInt64? {
+        let first = firstHostTime.load(ordering: .acquiring)
+        return first == 0 ? nil : first
+    }
+    var isRunning: Bool { running.load(ordering: .relaxed) }
+
+    func start(writer: CAFWriter) throws(EarmarkError) {
+        try control.sync { () -> Result<Void, EarmarkError> in
+            guard self.writer == nil else { return .success(()) }
+            level.store(0, ordering: .relaxed)
+            firstHostTime.store(0, ordering: .relaxed)
+            writeQueue.sync {
+                accepting = true
+                windowSum = 0
+                windowFrames = 0
+                reportedWriteError = false
+            }
+            self.writer = writer
+            do throws(EarmarkError) {
+                try attach()
+            } catch {
+                self.writer = nil
+                return .failure(error)
+            }
+            listenForDefaultInput()
+            running.store(true, ordering: .relaxed)
+            return .success(())
+        }.get()
+    }
+
+    /// Останавливает движок и дожидается записи уже пришедших буферов: после возврата writer можно закрывать.
+    func stop() {
+        control.sync {
+            guard writer != nil else { return }
+            pendingRestart?.cancel()
+            pendingRestart = nil
+            stopListeningForDefaultInput()
+            detach()
+            writer = nil
+            running.store(false, ordering: .relaxed)
+        }
+        // Барьер: всё, что тап отдал до этой точки, уже в файле; опоздавшие буферы отбросит `accepting`.
+        writeQueue.sync { accepting = false }
+    }
+
+    // MARK: - Движок
+
+    /// Новый AVAudioEngine на текущем default input: старый после смены устройства на нём и остался бы.
+    private func attach() throws(EarmarkError) {
+        guard let writer else { return }
+        let device = AudioProcessList.defaultInputDevice()
+        let engine = AVAudioEngine()
+        let input = engine.inputNode
+        let format = input.outputFormat(forBus: 0)
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            throw .unavailable("no input device")
+        }
+        let target = writer.clientFormat
+        let converter: AVAudioConverter?
+        if format == target {
+            converter = nil
+        } else {
+            // Файл держит формат первой записи; новое устройство (48k колонки, 16k HFP) приводим к нему.
+            // Mono-выход конвертер берёт из канала 0 — как и ExtAudioFile; для микрофона это основной канал.
+            guard let made = AVAudioConverter(from: format, to: target) else {
+                throw .operationFailed("no converter from \(format) to \(target)")
+            }
+            converter = made
+        }
+        // Поколение растёт с каждым движком: по нему очередь записи узнаёт первый буфер после рестарта.
+        generation += 1
+        let tap = TapContext(generation: generation, writer: writer, converter: converter, target: target)
+        input.installTap(onBus: 0, bufferSize: 4_096, format: format) { [weak self] buffer, when in
+            guard let self else { return }
+            self.lastTapHostTime.store(AudioGetCurrentHostTime(), ordering: .relaxed)
+            // Буфер приводим и копируем здесь, на потоке тапа: в свою очередь уходит наш собственный буфер.
+            guard let owned = tap.own(buffer) else { return }
+            let host = when.isHostTimeValid ? when.hostTime : nil
+            self.writeQueue.async { self.write(owned, hostTime: host, tap: tap) }
+        }
+        engine.prepare()
+        do {
+            try engine.start()
+        } catch {
+            input.removeTap(onBus: 0)
+            throw .operationFailed("the microphone did not start: \(error.localizedDescription)")
+        }
+        configObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.control.async { self.scheduleRestart(reason: "AVAudioEngineConfigurationChange") }
+        }
+        self.engine = engine
+        self.device = device
+        inputFormat = format
+        let deviceID = device ?? 0
+        Self.log.info(
+            """
+            mic: device \(deviceID, privacy: .public), \(format.sampleRate, privacy: .public) Hz \
+            × \(format.channelCount, privacy: .public)
+            """)
+    }
+
+    private func detach() {
+        if let configObserver { NotificationCenter.default.removeObserver(configObserver) }
+        configObserver = nil
+        engine?.stop()
+        engine?.inputNode.removeTap(onBus: 0)
+        engine = nil
+    }
+
+    private func scheduleRestart(reason: String) {
+        guard writer != nil else { return }
+        pendingRestart?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.restart(reason: reason) }
+        pendingRestart = work
+        control.asyncAfter(deadline: .now() + Self.restartDebounce, execute: work)
+    }
+
+    private func restart(reason: String) {
+        guard writer != nil else { return }
+        // Уведомление ещё не значит, что движок умер: при старте системного tap оно приходит, а микрофон
+        // пишет дальше (замер S1). Рестарт тогда дал бы лишь дыру в начале каждой записи.
+        if let engine, engine.isRunning, AudioProcessList.defaultInputDevice() == device,
+            engine.inputNode.outputFormat(forBus: 0) == inputFormat, isTapAlive
+        {
+            Self.log.info("mic: \(reason, privacy: .public), the engine keeps delivering, no restart")
+            return
+        }
+        Self.log.warning("mic: restart (\(reason, privacy: .public))")
+        detach()
+        do throws(EarmarkError) {
+            try attach()
+        } catch {
+            // Устройство могло ещё не появиться (AirPods на полпути) — пробуем снова; дыру закроет первый
+            // буфер, когда движок наконец поднимется.
+            Self.log.error("mic: restart failed: \(error.message, privacy: .public), retrying in 2 s")
+            let work = DispatchWorkItem { [weak self] in self?.restart(reason: "retry") }
+            pendingRestart = work
+            control.asyncAfter(deadline: .now() + Self.retryDelay, execute: work)
+        }
+    }
+
+    /// Тап звался за последние `restartDebounce`, то есть уже после уведомления. Буфер тапа — до 400 мс.
+    private var isTapAlive: Bool {
+        let last = lastTapHostTime.load(ordering: .relaxed)
+        let now = AudioGetCurrentHostTime()
+        return now >= last && Double(now - last) < Self.restartDebounce * ticksPerSecond
+    }
+
+    private static let defaultInputAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice, mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+
+    private func listenForDefaultInput() {
+        var address = Self.defaultInputAddress
+        let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            self?.scheduleRestart(reason: "default input changed")
+        }
+        let status = AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &address, control, listener)
+        if status == noErr {
+            defaultInputListener = listener
+        } else {
+            Self.log.error("mic: cannot watch the default input (OSStatus \(status, privacy: .public))")
+        }
+    }
+
+    private func stopListeningForDefaultInput() {
+        guard let listener = defaultInputListener else { return }
+        var address = Self.defaultInputAddress
+        AudioObjectRemovePropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &address, control, listener)
+        defaultInputListener = nil
+    }
+
+    // MARK: - Запись (writeQueue)
+
+    private func write(_ buffer: AVAudioPCMBuffer, hostTime: UInt64?, tap: TapContext) {
+        guard accepting else { return }
+        let writer = tap.writer
+        do {
+            if tap.generation != writtenGeneration {
+                // Первый буфер нового движка: дыра = его host time минус «где трек должен быть». У первого
+                // движка сеанса firstHostTime ещё 0 — паддить нечего.
+                let first = firstHostTime.load(ordering: .acquiring)
+                if first != 0, let hostTime {
+                    let gap = PaddingMath.gapFrames(
+                        startHostTime: first, framesWritten: writer.framesWritten, actualHostTime: hostTime,
+                        sampleRate: writer.clientFormat.sampleRate, hostTicksPerSecond: ticksPerSecond)
+                    if gap > 0 {
+                        Self.log.info("mic: gap after restart, \(gap, privacy: .public) frames of silence")
+                        try writer.writeSilence(frames: AVAudioFrameCount(clamping: gap))
+                    }
+                }
+                writtenGeneration = tap.generation
+            }
+            if firstHostTime.load(ordering: .relaxed) == 0 {
+                firstHostTime.store(hostTime ?? AudioGetCurrentHostTime(), ordering: .releasing)
+            }
+            try writer.write(buffer)
+            measure(buffer)
+        } catch {
+            // Диск полон или writer закрыт — сообщаем один раз, а не на каждый буфер.
+            if !reportedWriteError {
+                Self.log.error("mic.caf: \(error.localizedDescription, privacy: .public)")
+            }
+            reportedWriteError = true
+        }
+    }
+
+    private func measure(_ buffer: AVAudioPCMBuffer) {
+        guard let data = buffer.floatChannelData?[0] else { return }
+        var sum: Float = 0
+        vDSP_svesq(data, 1, &sum, vDSP_Length(buffer.frameLength))
+        windowSum += sum
+        windowFrames += Int(buffer.frameLength)
+        guard Double(windowFrames) >= buffer.format.sampleRate else { return }
+        level.store((windowSum / Float(windowFrames)).squareRoot(), ordering: .relaxed)
+        windowSum = 0
+        windowFrames = 0
+    }
+}
+
+/// Состояние одного движка, нужное блоку тапа. Тап вызывается последовательно на одном потоке, поэтому
+/// конвертер без замков; новый движок — новый контекст.
+private final class TapContext: @unchecked Sendable {
+    let generation: Int
+    let writer: CAFWriter
+    private let converter: AVAudioConverter?
+    private let target: AVAudioFormat
+
+    init(generation: Int, writer: CAFWriter, converter: AVAudioConverter?, target: AVAudioFormat) {
+        self.generation = generation
+        self.writer = writer
+        self.converter = converter
+        self.target = target
+    }
+
+    /// Буфер в формате writer'а, принадлежащий нам: тап может переиспользовать свою память.
+    func own(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard let converter else { return copy(buffer) }
+        let ratio = target.sampleRate / buffer.format.sampleRate
+        let capacity = AVAudioFrameCount((Double(buffer.frameLength) * ratio).rounded(.up)) + 64
+        guard let output = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: capacity) else { return nil }
+        // Блок ввода @Sendable: «уже отдали» храним в ящике, а не в локальной var.
+        final class Fed: @unchecked Sendable { var done = false }
+        let fed = Fed()
+        var error: NSError?
+        // .noDataNow, а не .endOfStream: хвост ресэмплера остаётся в конвертере и выйдет со следующим
+        // буфером, а не теряется на каждом стыке.
+        let status = converter.convert(to: output, error: &error) { _, inputStatus in
+            guard !fed.done else {
+                inputStatus.pointee = .noDataNow
+                return nil
+            }
+            fed.done = true
+            inputStatus.pointee = .haveData
+            return buffer
+        }
+        return status == .error || output.frameLength == 0 ? nil : output
+    }
+
+    private func copy(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard let output = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: buffer.frameLength)
+        else {
+            return nil
+        }
+        output.frameLength = buffer.frameLength
+        let source = UnsafeMutableAudioBufferListPointer(
+            UnsafeMutablePointer(mutating: buffer.audioBufferList))
+        let destination = UnsafeMutableAudioBufferListPointer(output.mutableAudioBufferList)
+        for (from, to) in zip(source, destination) {
+            if let src = from.mData, let dst = to.mData {
+                memcpy(dst, src, Int(min(from.mDataByteSize, to.mDataByteSize)))
+            }
+        }
+        return output
+    }
+}

@@ -21,6 +21,7 @@ struct MenuContent: View {
 
         #if DEBUG
         DebugSystemCaptureMenu()
+        DebugMicCaptureMenu()
         #endif
         Button("Quit Earmark") { NSApplication.shared.terminate(nil) }
             .keyboardShortcut("q")

@@ -22,6 +22,49 @@ final class AppModel {
     @ObservationIgnored private var loginItemProblem: String?
     @ObservationIgnored private var ticker: Task<Void, Never>?
     @ObservationIgnored let logger = Logger(subsystem: EarmarkPaths.bundleID, category: "app")
+    /// Сеанс записи. lazy: замыканиям нужен self, а до конца init его захватывать нельзя.
+    @ObservationIgnored private(set) lazy var session = RecordingSession(
+        store: { [weak self] in RecordingStore(root: (self?.config ?? Config()).recordingsDir) },
+        config: { [weak self] in self?.config ?? Config() })
+    /// Временно, до Task 16: монитор созвона на app один, и Task 16 переносит его в SchedulerDriver.
+    @ObservationIgnored private lazy var callMonitor = CallActivityMonitor(levels: session.levels)
+    /// Предупреждения записи (`capture_failed:…`, `far_end_digital_silence`, `start_failed:…`,
+    /// `finalize_failed:…`) — в status.warnings. Сбрасываются на каждом старте записи.
+    private(set) var recordingWarnings: [String] = []
+
+    var isRecording: Bool { session.isRecording }
+
+    /// Запись и детект созвона. Последняя строка start(): AppDelegate зовёт его только после проверки
+    /// TestEnvironment, так что под тестами ни захвата, ни восстановления нет.
+    func startRecordingServices() {
+        session.onStarted = { [weak self] in self?.recordingWarnings = [] }
+        session.onWarning = { [weak self] warning in
+            guard let self, !self.recordingWarnings.contains(warning) else { return }
+            self.recordingWarnings.append(warning)
+        }
+        callMonitor.start { [weak self] sample in self?.session.ingest(sample) }  // убирает Task 16
+        Task { await session.recoverInterrupted() }  // Task 23 переносит за создание очереди
+    }
+
+    /// Ручная запись из меню, CLI и агента. Идемпотентна: идёт запись — вернёт её. Отказ старта виден в
+    /// status.warnings (`start_failed:…`), а не только в логе: из меню иначе «ничего не произошло».
+    func startManual(title: String?) throws(EarmarkError) -> CurrentRecordingInfo {
+        if let current = session.current { return current }
+        let request = RecordingSession.StartRequest(
+            trigger: .manual, title: title ?? "Manual recording", meeting: nil, calendarFolder: nil)
+        recordingWarnings = []
+        do throws(EarmarkError) {
+            return try session.start(request)
+        } catch {
+            recordingWarnings = ["start_failed:\(error.message)"]
+            throw error
+        }
+    }
+
+    /// Стоп из меню, CLI и агента; ответ — после финализации. nil — писать было нечего или запись отброшена.
+    func stopRecording() async throws(EarmarkError) -> RecordingMeta? {
+        try await session.stop(reason: .manual)
+    }
 
     /// status() начинает с него, а каждая задача, которой есть что сказать, дописывает своё
     /// перед `return data`. Версия — EarmarkVersion (Task 1): одна на app, CLI и meta.json.
@@ -57,6 +100,7 @@ final class AppModel {
                 self?.refreshSnapshot()
             }
         }
+        startRecordingServices()
     }
 
     func shutdown() {
@@ -68,6 +112,11 @@ final class AppModel {
         if let configProblem { data.warnings.append("config_unreadable: \(configProblem)") }
         // Префикс `launch_at_login:` уже стоит в тексте ошибки (setLaunchAtLogin).
         if let loginItemProblem { data.warnings.append(loginItemProblem) }
+        if let current = session.current {
+            data.state = "recording"
+            data.recording = current
+        }
+        data.warnings += recordingWarnings
         return data
     }
 
@@ -77,7 +126,7 @@ final class AppModel {
         #if DEBUG
         if UserDefaults.standard.bool(forKey: "debugRecordingIcon") { return true }
         #endif
-        return snapshot.state == "recording"
+        return session.isRecording || snapshot.state == "recording"
     }
 
     // MARK: - конфиг

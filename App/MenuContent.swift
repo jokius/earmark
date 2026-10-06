@@ -8,6 +8,12 @@ struct MenuContent: View {
     let model: AppModel
 
     var body: some View {
+        if model.isRecording {
+            Button("Stop recording") { Task { _ = try? await model.stopRecording() } }
+        } else {
+            Button("Start recording") { _ = try? model.startManual(title: nil) }
+        }
+        Divider()
         Text(Self.statusLine(model.snapshot))
         ForEach(model.snapshot.warnings, id: \.self) { warning in
             Text("Warning: \(warning)")
@@ -19,10 +25,6 @@ struct MenuContent: View {
 
         Divider()
 
-        #if DEBUG
-        DebugSystemCaptureMenu()
-        DebugMicCaptureMenu()
-        #endif
         Button("Quit Earmark") { NSApplication.shared.terminate(nil) }
             .keyboardShortcut("q")
     }

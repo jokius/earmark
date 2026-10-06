@@ -103,16 +103,6 @@ final class SystemAudioRecorder: @unchecked Sendable {
         }
     }
 
-    #if DEBUG
-    /// Только для ручной проверки watchdog: глушит IO, не трогая watchdog, — как если бы tap молча
-    /// перестал звать IOProc. Через 45 с watchdog обязан пересобрать tap и закрыть дыру тишиной.
-    func simulateStall() {
-        control.sync {
-            if let procID, aggregateID != kAudioObjectUnknown { AudioDeviceStop(aggregateID, procID) }
-        }
-    }
-    #endif
-
     // MARK: - Сборка и разборка
 
     /// tap → формат → aggregate → IOProc → старт. На любой ошибке разбирает собранное.

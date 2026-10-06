@@ -1,10 +1,16 @@
 import EarmarkCore
+import EarmarkTranscription
 import Foundation
 
 /// Точка входа CLI. Вся логика здесь, а не в CLI/main.swift, чтобы её проверял `swift test`.
 public enum EarmarkCLI {
     /// argv без имени бинаря → exit code. Каркас: команд пока нет, есть только `help`.
     public static func run(_ argv: [String]) async -> Int32 {
+        // Спайк S2 (Task 3): скрытая команда до разбора таблицы команд. Task 18 переписывает run()
+        // уже без неё: S2 к тому времени закрыт.
+        if argv.first == "_whisper-probe" {
+            return WhisperProbe.run(Array(argv.dropFirst()))
+        }
         if argv.isEmpty || argv == ["help"] {
             let data: [String: Any] = ["version": EarmarkVersion.current]
             emit(["schema_version": 1, "command": "help", "data": data], to: .standardOutput)

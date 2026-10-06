@@ -21,7 +21,8 @@ public struct CLIContext: Sendable {
 
 /// Путь команды → обработчик. Таблица команд (разбор, help, MCP) живёт в EarmarkCore.CommandTable,
 /// здесь только исполнение. Команда из таблицы без обработчика отвечает unavailable: так
-/// `model …` и `mcp` видны в help ещё до того, как их соберут.
+/// `model …` видны в help ещё до того, как их соберут. `mcp` сюда не входит — это не команда
+/// с одним ответом, EarmarkCLI.run уводит её в MCPCommand раньше.
 public enum Registry {
     /// Ключ — путь команды, склеенный пробелом ("calendars enable").
     public static var handlers: [String: CommandHandler] {

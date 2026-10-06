@@ -19,6 +19,11 @@ public enum EarmarkCLI {
             return error.exitCode
         }
         let command = parsed.path.joined(separator: " ")
+        // stdio-сервер — не команда с одним ответом: конверт не печатаем, stdout целиком его.
+        if command == "mcp" {
+            return await MCPCommand.serve(
+                lines: MCPCommand.lines(FileHandle.standardInput.bytes), context: context)
+        }
         do throws(EarmarkError) {
             guard let handler = Registry.handlers[command] else {
                 throw EarmarkError.unavailable("command \"\(command)\" is not available in this build")

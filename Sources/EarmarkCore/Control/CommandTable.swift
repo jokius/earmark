@@ -68,7 +68,10 @@ public enum CommandTable {
             path: ["recordings"], summary: "Recordings, newest first",
             options: [
                 value("--since", "Only recordings started at or after this ISO 8601 date or time"),
-                value("--until", "Only recordings started before this ISO 8601 date or time"),
+                value(
+                    "--until",
+                    "Only recordings started before this ISO 8601 date-time; "
+                        + "a date (YYYY-MM-DD) includes the whole day"),
                 value("--calendar", "Calendar id"),
                 value("--status", "recording, recorded, transcribing, transcribed or transcription_failed"),
                 value("--limit", "Maximum number of recordings (integer)"),

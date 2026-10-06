@@ -1,0 +1,16 @@
+.DS_Store
+.remember/
+build/
+DerivedData/
+.build/
+.swiftpm/
+
+# Генерируются xcodegen — в гит не идут
+*.xcodeproj
+App/Info.plist
+
+xcuserdata/
+*.xcuserstate
+
+# Личные настройки подписи
+signing.local

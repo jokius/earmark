@@ -1,0 +1,126 @@
+name: Earmark
+
+options:
+  bundleIdPrefix: com.konayre
+  deploymentTarget:
+    macOS: "15.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+  developmentLanguage: en
+
+# Корень репозитория — сам SwiftPM-пакет: app и CLI берут из него библиотеки, а логика
+# тестируется `swift test` без запуска приложения (§3.1 п.4).
+packages:
+  Earmark:
+    path: .
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ENABLE_HARDENED_RUNTIME: YES
+    # По умолчанию ad-hoc, чтобы проект собирался у любого без настройки. Своя identity —
+    # в signing.local (см. signing.local.example): ad-hoc меняет cdhash при каждой сборке,
+    # и TCC заново спрашивает микрофон, системный звук и календари.
+    #
+    # Ad-hoc в обеих конфигурациях: App Store-архива, ради которого Call Reminder держит
+    # Release без identity, здесь нет. signing.local перебивает identity с командной строки make.
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "-"
+
+targets:
+  Earmark:
+    type: application
+    platform: macOS
+    sources:
+      - path: App
+      # VAD-модель (885 KB, MIT): CLI ищет её по пути Contents/Helpers/../Resources.
+      - path: Resources/Models/ggml-silero-v5.1.2.bin
+        buildPhase: resources
+    dependencies:
+      # App берёт только Core и Audio: whisper в процесс app не попадает никогда (§3.1 п.3).
+      - package: Earmark
+        products:
+          - EarmarkCore
+          - EarmarkAudio
+      # CLI едет внутри бандла, чтобы версии app и CLI всегда совпадали. Не в Contents/MacOS:
+      # на регистронезависимом APFS earmark и Earmark — один файл, и CLI затёр бы бинарь app.
+      - target: EarmarkTool
+        embed: true
+        codeSign: true
+        copy:
+          destination: wrapper
+          subpath: Contents/Helpers
+      # whisper.framework кладём в Contents/Frameworks, но не линкуем в app: он нужен только CLI.
+      # Xcode распаковывает XCFramework в BUILT_PRODUCTS_DIR, когда собирает EarmarkTool.
+      - framework: whisper.framework
+        implicit: true
+        embed: true
+        link: false
+        codeSign: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.konayre.earmark
+        PRODUCT_NAME: Earmark
+        CODE_SIGN_ENTITLEMENTS: App/Earmark.entitlements
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleName: Earmark
+        CFBundleDisplayName: Earmark
+        CFBundlePackageType: APPL
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        LSMinimumSystemVersion: "$(MACOSX_DEPLOYMENT_TARGET)"
+        LSUIElement: true
+        NSMicrophoneUsageDescription: >-
+          Earmark records your side of a call from the microphone.
+        NSAudioCaptureUsageDescription: >-
+          Earmark records the other side of a call from system audio.
+        NSCalendarsFullAccessUsageDescription: >-
+          Earmark reads the calendars you choose to start recording just before a meeting.
+    preBuildScripts:
+      - name: SwiftLint
+        basedOnDependencyAnalysis: false
+        script: |
+          if [ "$ENABLE_USER_SCRIPT_SANDBOXING" = "YES" ]; then
+            echo "warning: SwiftLint skipped (user script sandboxing is on)"; exit 0
+          fi
+          SWIFTLINT="$(command -v swiftlint || echo /opt/homebrew/bin/swiftlint)"
+          if [ ! -x "$SWIFTLINT" ]; then
+            echo "warning: SwiftLint not installed — brew install swiftlint"; exit 0
+          fi
+          cd "$SRCROOT" && "$SWIFTLINT" lint --quiet
+
+  # Имя таргета отличается от app не только регистром намеренно: на регистронезависимом APFS
+  # каталоги Earmark.build и earmark.build совпадают, и чистая сборка ломается. Бинарь — earmark.
+  EarmarkTool:
+    type: tool
+    platform: macOS
+    sources:
+      - path: CLI
+    dependencies:
+      - package: Earmark
+        product: EarmarkCLI
+    settings:
+      base:
+        PRODUCT_NAME: earmark
+        # Модули таргетов копируются в Build/Products/<module>.swiftmodule: earmark и Earmark
+        # там столкнулись бы так же, как бинари.
+        PRODUCT_MODULE_NAME: EarmarkTool
+        PRODUCT_BUNDLE_IDENTIFIER: com.konayre.earmark.cli
+        # Своя подпись-идентичность, а не имя файла: так советует Apple для встроенных инструментов.
+        OTHER_CODE_SIGN_FLAGS: "$(inherited) -i $(PRODUCT_BUNDLE_IDENTIFIER)"
+        # Бинарь живёт в Contents/Helpers, фреймворк — в Contents/Frameworks. dyld раскрывает
+        # @executable_path по настоящему пути, поэтому symlink ~/.local/bin/earmark не мешает.
+        LD_RUNPATH_SEARCH_PATHS: "@executable_path/../Frameworks"
+
+schemes:
+  Earmark:
+    build:
+      targets:
+        Earmark: all
+    run:
+      config: Debug

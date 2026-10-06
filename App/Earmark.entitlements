@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Hardened Runtime пускает к микрофону и входу Core Audio только с этим ключом. -->
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+	<!-- То же для EventKit: без ключа запрос доступа к календарям не проходит. -->
+	<key>com.apple.security.personal-information.calendars</key>
+	<true/>
+	<!-- Sandbox нет намеренно (§3.1 п.5): путь сокета в контейнере длиннее sun_path, внешние
+	     читатели не видят записи, а импорт модели не может клонировать чужой файл. -->
+</dict>
+</plist>

@@ -1,9 +1,9 @@
 // Copyright (c) 2026 Andrew Jones
 // Copyright (c) 2026 Samat Galimov
 // SPDX-License-Identifier: MIT
-// Портировано из gsamat/amanu@fbccc13: Sources/amanu/Audio/MicRecorder.swift (MIT) — только ядро
-// рестартов (start L283-311, слушатель default input L687-720, рестарт L725-823, паддинг L855-873):
-// без voice processing, выбора микрофона звонилки и storm-guard.
+// Портировано из gsamat/amanu@fbccc13: Sources/amanu/Audio/MicRecorder.swift (MIT) — ядро рестартов
+// (start L283-311, слушатель default input L687-720, рестарт L725-823, паддинг L855-873) и привязка
+// к микрофону звонилки (bindInputDevice L633-655): без voice processing и storm-guard.
 @preconcurrency import AVFoundation
 import Accelerate
 import CoreAudio
@@ -17,6 +17,10 @@ import os
 ///
 /// Voice processing (VPIO) не включаем никогда: он приглушает чужой звук, может заглушить микрофон в
 /// Teams и Chrome и дестабилизирует aggregate с tap.
+///
+/// Пишем микрофон звонилки, а не системный default: микрофон выбирают в настройках звонилки (Teams,
+/// Jitsi), и default об этом не знает. Какие входы держит звонилка, раз в секунду сообщает
+/// CallActivityMonitor (`follow`), выбирает MicRoute. Без звонилки — default.
 ///
 /// Формат входа не фиксирован (BT-гарнитура в HFP — 1 ch 16 kHz, замер S1), а формат файла задан
 /// первой записью: каждый буфер приводим к `writer.clientFormat`.
@@ -51,6 +55,16 @@ final class MicRecorder: @unchecked Sendable {
     private var configObserver: (any NSObjectProtocol)?
     private var defaultInputListener: AudioObjectPropertyListenerBlock?
     private var pendingRestart: DispatchWorkItem?
+    /// Микрофоны звонилок с последнего опроса — хранятся и на простое: старт посреди созвона сразу берёт
+    /// микрофон звонилки.
+    private var callInputs: [AudioObjectID] = []
+    /// Микрофон звонилки, на котором держим запись; nil — системный default.
+    private var wanted: AudioObjectID?
+    private var settle = MicRoute.Settle()
+    /// Не поднялись в этой записи: до следующей к ним не возвращаемся.
+    private var refused: Set<AudioObjectID> = []
+    /// Последний attach привязал движок к `wanted` явно, мимо default. Отказ default в `refused` не идёт.
+    private var boundWanted = false
 
     // Только на `writeQueue`.
     /// Открыт от start до stop: буфер, который тап отдал уже после stop, в закрытый writer не идёт.
@@ -89,8 +103,11 @@ final class MicRecorder: @unchecked Sendable {
                 reportedWriteError = false
             }
             self.writer = writer
+            refused = []
+            settle = MicRoute.Settle()
+            wanted = route(current: nil)
             do throws(EarmarkError) {
-                try attach()
+                try attachWithFallback()
             } catch {
                 self.writer = nil
                 return .failure(error)
@@ -116,14 +133,62 @@ final class MicRecorder: @unchecked Sendable {
         writeQueue.sync { accepting = false }
     }
 
+    /// Входы звонилок с опроса CallActivityMonitor, с любого потока. Во время записи — переезд на микрофон
+    /// звонилки, когда новый выбор устоялся (MicRoute.Settle).
+    func follow(callInputs inputs: [AudioObjectID]) {
+        control.async { [self] in
+            callInputs = inputs
+            guard writer != nil else { return }
+            // nil — звонилка отпустила вход: остаёмся, где есть. Переключение внутри звонилки даёт пустой
+            // опрос, и прыжок на default стоил бы двух рестартов.
+            let choice = route(current: device)
+            // Звонилка на том микрофоне, который уже пишем: закрепляем его, иначе смена default увела бы запись.
+            if let choice, choice == device { wanted = choice }
+            guard settle.observe(choice, current: device), let target = choice else { return }
+            wanted = target
+            scheduleRestart(reason: "call app moved to \(Self.describe(target))")
+        }
+    }
+
     // MARK: - Движок
 
-    /// Новый AVAudioEngine на текущем default input: старый после смены устройства на нём и остался бы.
+    /// Какой микрофон писать по последнему опросу, без отказавших; nil — звонилка не держит входов.
+    private func route(current: AudioObjectID?) -> AudioObjectID? {
+        MicRoute.choose(
+            callInputs: callInputs.filter { !refused.contains($0) }, current: current,
+            systemDefault: AudioProcessList.defaultInputDevice())
+    }
+
+    /// attach, а не поднялся микрофон звонилки — ещё попытка на default. Не поднялся сам default (звонилка
+    /// на нём же) — запасного нет: ошибка уходит наверх, на ретрай рестарта.
+    private func attachWithFallback() throws(EarmarkError) {
+        do throws(EarmarkError) {
+            try attach()
+        } catch {
+            guard boundWanted, let wanted else { throw error }
+            refuse(wanted, because: error.message)
+            try attach()
+        }
+    }
+
+    /// Новый AVAudioEngine на микрофоне звонилки или текущем default input: старый после смены устройства
+    /// на нём и остался бы.
     private func attach() throws(EarmarkError) {
         guard let writer else { return }
-        let device = AudioProcessList.defaultInputDevice()
+        let fallback = AudioProcessList.defaultInputDevice()
         let engine = AVAudioEngine()
         let input = engine.inputNode
+        boundWanted = false
+        // Default движок берёт сам; другое устройство — только явно и до чтения формата.
+        if let wanted, wanted != fallback {
+            do {
+                try input.auAudioUnit.setDeviceID(wanted)
+                boundWanted = true
+            } catch {
+                refuse(wanted, because: error.localizedDescription)
+            }
+        }
+        let device = wanted ?? fallback
         let format = input.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else {
             throw .unavailable("no input device")
@@ -167,12 +232,29 @@ final class MicRecorder: @unchecked Sendable {
         self.engine = engine
         self.device = device
         inputFormat = format
-        let deviceID = device ?? 0
+        let name = device.map(Self.describe) ?? "none"
+        let source = wanted == nil ? "default" : "call app"
         Self.log.info(
             """
-            mic: device \(deviceID, privacy: .public), \(format.sampleRate, privacy: .public) Hz \
-            × \(format.channelCount, privacy: .public)
+            mic: device \(name, privacy: .public) (\(source, privacy: .public)), \
+            \(format.sampleRate, privacy: .public) Hz × \(format.channelCount, privacy: .public)
             """)
+    }
+
+    /// Микрофон звонилки не поднялся: пишем default и к этому устройству до конца записи не возвращаемся.
+    private func refuse(_ device: AudioObjectID, because reason: String) {
+        refused.insert(device)
+        wanted = nil
+        Self.log.warning(
+            """
+            mic: cannot record \(Self.describe(device), privacy: .public) \
+            (\(reason, privacy: .public)), using the default input
+            """)
+    }
+
+    /// «Имя (id)» для логов.
+    private static func describe(_ device: AudioObjectID) -> String {
+        "\(AudioProcessList.deviceName(device) ?? "?") (\(device))"
     }
 
     private func detach() {
@@ -191,11 +273,13 @@ final class MicRecorder: @unchecked Sendable {
         control.asyncAfter(deadline: .now() + Self.restartDebounce, execute: work)
     }
 
-    private func restart(reason: String) {
+    private func restart(reason: String, isRetry: Bool = false) {
         guard writer != nil else { return }
         // Уведомление ещё не значит, что движок умер: при старте системного tap оно приходит, а микрофон
-        // пишет дальше (замер S1). Рестарт тогда дал бы лишь дыру в начале каждой записи.
-        if let engine, engine.isRunning, AudioProcessList.defaultInputDevice() == device,
+        // пишет дальше (замер S1). Рестарт тогда дал бы лишь дыру в начале каждой записи. Сверяем с микрофоном
+        // звонилки, а не с одним default: смена default при записи с микрофона звонилки дала бы холостой
+        // рестарт.
+        if let engine, engine.isRunning, device == wanted ?? AudioProcessList.defaultInputDevice(),
             engine.inputNode.outputFormat(forBus: 0) == inputFormat, isTapAlive
         {
             Self.log.info("mic: \(reason, privacy: .public), the engine keeps delivering, no restart")
@@ -204,12 +288,14 @@ final class MicRecorder: @unchecked Sendable {
         Self.log.warning("mic: restart (\(reason, privacy: .public))")
         detach()
         do throws(EarmarkError) {
-            try attach()
+            // Сразу после уведомления устройство часто ещё поднимается (BT-гарнитура сменила профиль):
+            // первая неудача — повод для ретрая на том же микрофоне, а не отказ от него до конца записи.
+            if isRetry { try attachWithFallback() } else { try attach() }
         } catch {
             // Устройство могло ещё не появиться (AirPods на полпути) — пробуем снова; дыру закроет первый
             // буфер, когда движок наконец поднимется.
             Self.log.error("mic: restart failed: \(error.message, privacy: .public), retrying in 2 s")
-            let work = DispatchWorkItem { [weak self] in self?.restart(reason: "retry") }
+            let work = DispatchWorkItem { [weak self] in self?.restart(reason: "retry", isRetry: true) }
             pendingRestart = work
             control.asyncAfter(deadline: .now() + Self.retryDelay, execute: work)
         }

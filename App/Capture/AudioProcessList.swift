@@ -12,8 +12,9 @@ enum AudioProcessList {
         /// Пустая строка у процессов без бандла (CLI-утилиты, часть демонов).
         let bundleID: String
         let isRunningInput: Bool
-        /// Устройства, на которых процесс ведёт input. У corespeechd пусто при IsRunningInput = 1.
-        let inputDeviceCount: Int
+        /// Устройства, на которых процесс ведёт input, как их отдаёт HAL. У corespeechd пусто при
+        /// IsRunningInput = 1.
+        let inputDevices: [AudioObjectID]
     }
 
     /// Все HAL-клиенты, включая нас самих: отсеивает вызывающий (CallApps.isCallActivity).
@@ -26,7 +27,7 @@ enum AudioProcessList {
             return Client(
                 pid: pid_t(bitPattern: pid), bundleID: string(object, kAudioProcessPropertyBundleID) ?? "",
                 isRunningInput: uint32(object, kAudioProcessPropertyIsRunningInput) == 1,
-                inputDeviceCount: inputs.count)
+                inputDevices: inputs)
         }
     }
 
@@ -51,6 +52,26 @@ enum AudioProcessList {
     static func defaultInputDevice() -> AudioObjectID? {
         uint32(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyDefaultInputDevice)
             .flatMap { $0 == kAudioObjectUnknown ? nil : $0 }
+    }
+
+    /// Микрофоны, которые можно записать, из устройств процесса. Голосовая обработка (VPIO) отдаёт приватный
+    /// агрегат — раскрываем его до активных под-устройств. Выход в списке бывает (duplex), но без входных
+    /// стримов он не микрофон. Порядок сохраняется, дубли убираются.
+    static func recordableInputs(_ devices: [AudioObjectID]) -> [AudioObjectID] {
+        var seen = Set<AudioObjectID>()
+        return devices.flatMap { device in
+            uint32(device, kAudioObjectPropertyClass) == kAudioAggregateDeviceClassID
+                ? objects(device, kAudioAggregateDevicePropertyActiveSubDeviceList) : [device]
+        }
+        .filter { device in
+            !objects(device, kAudioDevicePropertyStreams, scope: kAudioObjectPropertyScopeInput).isEmpty
+                && seen.insert(device).inserted
+        }
+    }
+
+    /// Имя устройства для логов.
+    static func deviceName(_ device: AudioObjectID) -> String? {
+        string(device, kAudioObjectPropertyName)
     }
 
     private static func objects(

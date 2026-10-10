@@ -1,5 +1,6 @@
 @preconcurrency import AVFoundation
 import AppKit
+import CoreAudio
 import EarmarkAudio
 import EarmarkCore
 import Foundation
@@ -35,6 +36,9 @@ final class RecordingSession {
     /// Уровни каналов для CallActivityMonitor: он читает их со своей очереди, без main actor.
     /// Рекордеры отдают 0, пока не пишут, поэтому при простое здесь (0, 0).
     nonisolated let levels: @Sendable () -> (mic: Float, system: Float)
+    /// Микрофоны звонилок от CallActivityMonitor, со своей очереди: MicRecorder пишет микрофон звонилки.
+    /// Зовётся и на простое — старт записи посреди созвона сразу берёт нужный микрофон.
+    nonisolated let followCallInputs: @Sendable ([AudioObjectID]) -> Void
 
     private let store: () -> RecordingStore
     private let config: () -> Config
@@ -63,6 +67,7 @@ final class RecordingSession {
         self.mic = mic
         self.system = system
         levels = { (mic.levelRMS, system.levelRMS) }
+        followCallInputs = { mic.follow(callInputs: $0) }
         // На сон финализируем по-настоящему: CAF закрываются до сна, сведение доработает после пробуждения.
         observers.append(
             NSWorkspace.shared.notificationCenter.addObserver(

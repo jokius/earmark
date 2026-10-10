@@ -1,3 +1,4 @@
+import CoreAudio
 import EarmarkCore
 import Foundation
 import os
@@ -11,6 +12,7 @@ final class CallActivityMonitor: @unchecked Sendable {
     private static let log = Logger(subsystem: "com.konayre.earmark", category: "calls")
 
     private let levels: @Sendable () -> (mic: Float, system: Float)
+    private let callInputs: @Sendable ([AudioObjectID]) -> Void
     private let queue = DispatchQueue(label: "com.konayre.earmark.call-activity", qos: .utility)
     // Только на `queue`.
     private var timer: DispatchSourceTimer?
@@ -18,8 +20,14 @@ final class CallActivityMonitor: @unchecked Sendable {
     /// почему авто-запись остановилась.
     private var wasActive = false
 
-    init(levels: @escaping @Sendable () -> (mic: Float, system: Float)) {
+    /// `callInputs` зовётся на каждом опросе, на очереди монитора: микрофоны, которые держат звонилки
+    /// (AudioProcessList.recordableInputs), — по ним MicRecorder идёт за микрофоном звонилки.
+    init(
+        levels: @escaping @Sendable () -> (mic: Float, system: Float),
+        callInputs: @escaping @Sendable ([AudioObjectID]) -> Void
+    ) {
         self.levels = levels
+        self.callInputs = callInputs
     }
 
     func start(onSample: @escaping @MainActor (ActivitySample) -> Void) {
@@ -46,19 +54,22 @@ final class CallActivityMonitor: @unchecked Sendable {
     private func sample() -> ActivitySample {
         let own = getpid()
         var apps: [String] = []
+        var inputs: [AudioObjectID] = []
         var active = false
         for client in AudioProcessList.clients()
         where CallApps.isCallActivity(
             pid: client.pid, ownPID: own, bundleID: client.bundleID, isRunningInput: client.isRunningInput,
-            inputDeviceCount: client.inputDeviceCount)
+            inputDeviceCount: client.inputDevices.count)
         {
             active = true
+            inputs += client.inputDevices
             // Незнакомое приложение — по bundle id; у процессов без бандла остаётся только pid.
             let name =
                 CallApps.displayName(forBundleID: client.bundleID)
                 ?? (client.bundleID.isEmpty ? "pid:\(client.pid)" : client.bundleID)
             if !apps.contains(name) { apps.append(name) }
         }
+        callInputs(AudioProcessList.recordableInputs(inputs))
         if active != wasActive {
             wasActive = active
             let names = apps.joined(separator: ", ")

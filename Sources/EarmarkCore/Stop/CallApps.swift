@@ -26,6 +26,9 @@ public enum CallApps {
         "com.apple.universalaccessd",  // управление голосом
         "com.apple.accessibility.heard",  // распознавание звуков
         "com.apple.VoiceMemos",  // диктофон: запись, а не разговор
+        // Панель «Звук» Системных настроек: индикатор уровня входа держит микрофон, пока панель открыта.
+        // На приёмке попала в meta.call_apps реальной записи.
+        "com.apple.Sound-Settings.extension",
         // Другой рекордер встреч (Anarlog, бывший Hyprnote): забытый после звонка, он держал бы
         // callActive и не дал бы сработать call_ended, а на время переезда оба app могут работать
         // параллельно. Префикса вендора (`com.anarlog`) в denylist нет, поэтому здесь все сборки из

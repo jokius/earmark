@@ -58,7 +58,7 @@ final class SchedulerDriver {
         // Монитор созвона один на app и работает всегда, а не только во время записи: re-arm (§5 п.5)
         // стартует запись по появлению созвона, когда ничего не пишется. Сэмпл без записи (и поздний,
         // пришедший после стопа) сеанс просто пропускает.
-        let monitor = CallActivityMonitor(levels: session.levels)
+        let monitor = CallActivityMonitor(levels: session.levels, callInputs: session.followCallInputs)
         monitor.start { [weak self] sample in self?.ingest(sample) }
         self.monitor = monitor
         ticker = Task { [weak self] in

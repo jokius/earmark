@@ -46,6 +46,8 @@ struct CallAppsTests {
         #expect(CallApps.isIgnored(bundleID: "com.apple.assistantd"))
         #expect(CallApps.isIgnored(bundleID: "com.prakashjoshipax.VoiceInk"))
         #expect(CallApps.isIgnored(bundleID: "com.hyprnote.stable"))  // чужой рекордер встреч
+        // панель «Звук» в System Settings держит микрофон ради индикатора уровня входа
+        #expect(CallApps.isIgnored(bundleID: "com.apple.Sound-Settings.extension"))
         #expect(!CallApps.isIgnored(bundleID: "com.apple.avconferenced"))
         #expect(!CallApps.isIgnored(bundleID: "com.example.Dialer"))
     }
@@ -86,6 +88,8 @@ struct CallAppsTests {
             (pid: 2, bundleID: "com.electron.wispr-flow.helper", input: true, devices: 1, call: false),
             (pid: 3, bundleID: "com.hyprnote.stable.helper", input: true, devices: 1, call: false),
             (pid: 4, bundleID: "com.electron.wispr-flowx", input: true, devices: 1, call: true),
+            // открытая панель «Звук» — не созвон
+            (pid: 5, bundleID: "com.apple.Sound-Settings.extension", input: true, devices: 1, call: false),
         ])
     func callActivity(pid: Int32, bundleID: String, input: Bool, devices: Int, call: Bool) {
         #expect(

@@ -189,46 +189,27 @@ final class MicRecorder: @unchecked Sendable {
             }
         }
         let device = wanted ?? fallback
-        let format = input.outputFormat(forBus: 0)
-        guard format.sampleRate > 0, format.channelCount > 0 else {
+        guard let format = Self.deviceFormat(of: input), format.sampleRate > 0 else {
             throw .unavailable("no input device")
         }
-        let target = writer.clientFormat
-        let converter: AVAudioConverter?
-        if format == target {
-            converter = nil
-        } else {
-            // Файл держит формат первой записи; новое устройство (48k колонки, 16k HFP) приводим к нему.
-            // Mono-выход конвертер берёт из канала 0 — как и ExtAudioFile; для микрофона это основной канал.
-            guard let made = AVAudioConverter(from: format, to: target) else {
-                throw .operationFailed("no converter from \(format) to \(target)")
-            }
-            converter = made
-        }
-        // Поколение растёт с каждым движком: по нему очередь записи узнаёт первый буфер после рестарта.
-        generation += 1
-        let tap = TapContext(generation: generation, writer: writer, converter: converter, target: target)
-        input.installTap(onBus: 0, bufferSize: 4_096, format: format) { [weak self] buffer, when in
-            guard let self else { return }
-            self.lastTapHostTime.store(AudioGetCurrentHostTime(), ordering: .relaxed)
-            // Буфер приводим и копируем здесь, на потоке тапа: в свою очередь уходит наш собственный буфер.
-            guard let owned = tap.own(buffer) else { return }
-            let host = when.isHostTimeValid ? when.hostTime : nil
-            self.writeQueue.async { self.write(owned, hostTime: host, tap: tap) }
-        }
-        engine.prepare()
-        do {
-            try engine.start()
-        } catch {
-            input.removeTap(onBus: 0)
-            throw .operationFailed("the microphone did not start: \(error.localizedDescription)")
-        }
-        configObserver = NotificationCenter.default.addObserver(
+        try installTap(on: input, format: format, writer: writer)
+        // Подписка до start: только что привязанный движок встаёт сразу после старта, и уведомление, пришедшее до
+        // подписки, потерялось бы. Рестарт отложен и уйдёт в `control` уже после этого attach.
+        let observer = NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil
         ) { [weak self] _ in
             guard let self else { return }
             self.control.async { self.scheduleRestart(reason: "AVAudioEngineConfigurationChange") }
         }
+        engine.prepare()
+        do {
+            try engine.start()
+        } catch {
+            NotificationCenter.default.removeObserver(observer)
+            input.removeTap(onBus: 0)
+            throw .operationFailed("the microphone did not start: \(error.localizedDescription)")
+        }
+        configObserver = observer
         self.engine = engine
         self.device = device
         inputFormat = format
@@ -239,6 +220,66 @@ final class MicRecorder: @unchecked Sendable {
             mic: device \(name, privacy: .public) (\(source, privacy: .public)), \
             \(format.sampleRate, privacy: .public) Hz × \(format.channelCount, privacy: .public)
             """)
+    }
+
+    /// Формат, который отдаёт устройство. outputFormat узла после setDeviceID остаётся от прежнего устройства
+    /// (замер 10.10.2026: 48 kHz от MacBook на входе 16 kHz), и тап на нём не получает ни одного буфера:
+    /// частота тапа обязана совпадать с аппаратной. Канал один: трек моно, и из многоканального входа тап
+    /// берёт канал 0, основной у микрофона, — без микса (стандартный формат больше двух каналов и не умеет).
+    /// nil — входа нет.
+    private static func deviceFormat(of input: AVAudioInputNode) -> AVAudioFormat? {
+        let hardware = input.inputFormat(forBus: 0)
+        guard hardware.channelCount > 0 else { return nil }
+        return AVAudioFormat(standardFormatWithSampleRate: hardware.sampleRate, channels: 1)
+    }
+
+    /// Тап нового поколения: по поколению очередь записи узнаёт первый буфер после рестарта и закрывает дыру.
+    private func installTap(on input: AVAudioInputNode, format: AVAudioFormat, writer: CAFWriter)
+        throws(EarmarkError)
+    {
+        let target = writer.clientFormat
+        let converter: AVAudioConverter?
+        if format == target {
+            converter = nil
+        } else {
+            // Файл держит формат первой записи; новое устройство (48k колонки, 16k HFP) приводим к нему.
+            guard let made = AVAudioConverter(from: format, to: target) else {
+                throw .operationFailed("no converter from \(format) to \(target)")
+            }
+            converter = made
+        }
+        generation += 1
+        let tap = TapContext(generation: generation, writer: writer, converter: converter, target: target)
+        input.installTap(onBus: 0, bufferSize: 4_096, format: format) { [weak self] buffer, when in
+            guard let self else { return }
+            self.lastTapHostTime.store(AudioGetCurrentHostTime(), ordering: .relaxed)
+            // Буфер приводим и копируем здесь, на потоке тапа: в свою очередь уходит наш собственный буфер.
+            guard let owned = tap.own(buffer) else { return }
+            let host = when.isHostTimeValid ? when.hostTime : nil
+            self.writeQueue.async { self.write(owned, hostTime: host, tap: tap) }
+        }
+    }
+
+    /// Движок сам встал на смене конфигурации, а устройство и формат прежние: запускаем его же. Новый движок на
+    /// только что выбранном устройстве ловил ту же смену и тоже вставал (замер 10.10.2026: лишний рестарт на
+    /// каждый переезд, под нагрузкой — шторм рестартов). false — не завёлся, нужна пересборка.
+    private func restartInPlace(_ engine: AVAudioEngine) -> Bool {
+        guard let writer, let inputFormat else { return false }
+        let input = engine.inputNode
+        input.removeTap(onBus: 0)
+        do throws(EarmarkError) {
+            try installTap(on: input, format: inputFormat, writer: writer)
+        } catch {
+            return false
+        }
+        do {
+            try engine.start()
+        } catch {
+            Self.log.error(
+                "mic: the engine did not start again: \(error.localizedDescription, privacy: .public)")
+            return false
+        }
+        return true
     }
 
     /// Микрофон звонилки не поднялся: пишем default и к этому устройству до конца записи не возвращаемся.
@@ -279,13 +320,27 @@ final class MicRecorder: @unchecked Sendable {
         // пишет дальше (замер S1). Рестарт тогда дал бы лишь дыру в начале каждой записи. Сверяем с микрофоном
         // звонилки, а не с одним default: смена default при записи с микрофона звонилки дала бы холостой
         // рестарт.
-        if let engine, engine.isRunning, device == wanted ?? AudioProcessList.defaultInputDevice(),
-            engine.inputNode.outputFormat(forBus: 0) == inputFormat, isTapAlive
-        {
+        let running = engine?.isRunning == true
+        let sameDevice = device == wanted ?? AudioProcessList.defaultInputDevice()
+        let sameFormat = engine.flatMap { Self.deviceFormat(of: $0.inputNode) } == inputFormat
+        let tapAlive = isTapAlive
+        if running, sameDevice, sameFormat, tapAlive {
             Self.log.info("mic: \(reason, privacy: .public), the engine keeps delivering, no restart")
             return
         }
-        Self.log.warning("mic: restart (\(reason, privacy: .public))")
+        // Привязку сверяем по самому движку: пропавшее устройство AUHAL мог подменить default.
+        if let engine, !running, sameDevice, engine.inputNode.auAudioUnit.deviceID == device, sameFormat,
+            restartInPlace(engine)
+        {
+            Self.log.info("mic: \(reason, privacy: .public), the engine stopped, started it again in place")
+            return
+        }
+        Self.log.warning(
+            """
+            mic: restart (\(reason, privacy: .public)): running \(running, privacy: .public), \
+            same device \(sameDevice, privacy: .public), same format \(sameFormat, privacy: .public), \
+            tap alive \(tapAlive, privacy: .public)
+            """)
         detach()
         do throws(EarmarkError) {
             // Сразу после уведомления устройство часто ещё поднимается (BT-гарнитура сменила профиль):

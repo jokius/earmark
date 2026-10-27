@@ -121,6 +121,11 @@ final class AppModel {
         // Отказ авто-старта и сбой сведения A при переключении (next_event) иначе видны только в логе.
         scheduler.onWarning = { [weak self] in self?.addRecordingWarning($0) }
         self.scheduler = scheduler
+        // onChange у сервиса один: подписчиков раздаёт модель, а не тот, кто подписался последним.
+        calendarService.onChange = { [weak self, weak scheduler] in
+            scheduler?.calendarsChanged()
+            self?.calendarStoreVersion += 1
+        }
         let queue = TranscriptionQueue(
             store: { [weak self] in RecordingStore(root: (self?.config ?? Config()).recordingsDir) },
             config: { [weak self] in self?.config ?? Config() },
@@ -257,7 +262,15 @@ final class AppModel {
 
     // MARK: - календари
 
+    /// Растёт на каждом CalendarService.onChange. Store EventKit не @Observable, а окно Settings
+    /// должно увидеть новый календарь, аккаунт или выданный доступ без переоткрытия. Счётчик
+    /// меняется уже после reset() пустого store — своя подписка на EKEventStoreChanged читала бы
+    /// список раньше и видела пустоту.
+    private(set) var calendarStoreVersion = 0
+
     func calendarsList() -> [CalendarListItem] {
+        // Чтение подписывает вызывающую вьюху на изменения календаря; IPC получает свежий список.
+        _ = calendarStoreVersion
         let all = calendarService.calendars()
         let enabled = Set(config.calendars)
         return all.map { calendar in
@@ -274,19 +287,22 @@ final class AppModel {
         scheduler?.upcoming(hours: hours) ?? []
     }
 
-    #if DEBUG
-    /// Переключатель календаря из Debug-меню: проверка расписания не ждёт IPC и CLI.
-    func debugSetCalendar(_ id: String, enabled: Bool) {
-        var ids = config.calendars.filter { $0 != id }
-        if enabled { ids.append(id) }
-        let raw = (try? JSONEncoder().encode(ids)).flatMap { String(bytes: $0, encoding: .utf8) } ?? "[]"
+    /// Переключатель календаря в окне Settings. Путь тот же, что у CLI: проверка, атомарная запись
+    /// config.json, планировщик видит новый список на следующем тике.
+    func setCalendar(_ id: String, enabled: Bool) {
+        let ids = CalendarSelection.toggled(config.calendars, id: id, enabled: enabled)
+        // JSON-массив, а не список через запятую: id календаря — непрозрачная строка EventKit.
+        // [String] кодируется всегда; запасное "[]" здесь выключило бы все календари.
+        guard let data = try? JSONEncoder().encode(ids), let raw = String(bytes: data, encoding: .utf8) else {
+            logger.error("calendars: cannot encode the calendar list")
+            return
+        }
         do {
             _ = try setConfig("calendars", raw: raw)
         } catch {
-            logger.error("debug calendars: \(error.message, privacy: .public)")
+            logger.error("calendars: \(error.message, privacy: .public)")
         }
     }
-    #endif
 
     // MARK: - конфиг
 

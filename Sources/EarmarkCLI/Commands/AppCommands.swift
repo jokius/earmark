@@ -62,15 +62,13 @@ enum AppCommands {
     static func enableCalendar(
         _ parsed: ParsedCommand, _ context: CLIContext
     ) async throws(EarmarkError) -> JSONValue {
-        try await updateCalendars(parsed, context) { ids, id in
-            if !ids.contains(id) { ids.append(id) }
-        }
+        try await updateCalendars(parsed, context, enabled: true)
     }
 
     static func disableCalendar(
         _ parsed: ParsedCommand, _ context: CLIContext
     ) async throws(EarmarkError) -> JSONValue {
-        try await updateCalendars(parsed, context) { ids, id in ids.removeAll { $0 == id } }
+        try await updateCalendars(parsed, context, enabled: false)
     }
 
     static func configSet(
@@ -144,14 +142,13 @@ enum AppCommands {
 
     /// enable/disable — это `config set calendars` с новым списком, своих IPC-методов у них нет.
     /// Список берём с диска: app — единственный писатель config.json и пишет его атомарно,
-    /// так что на диске то же, что у app в памяти. Порядок сохраняем — он задаёт приоритет
-    /// календаря при одновременных событиях (§5 п.3), поэтому новый id встаёт в конец.
+    /// так что на диске то же, что у app в памяти. Правило списка (порядок = приоритет) — общее
+    /// с окном Settings.
     private static func updateCalendars(
-        _ parsed: ParsedCommand, _ context: CLIContext, _ change: (inout [String], String) -> Void
+        _ parsed: ParsedCommand, _ context: CLIContext, enabled: Bool
     ) async throws(EarmarkError) -> JSONValue {
         let id = try parsed.argument("id")
-        var ids = try context.loadConfig().calendars
-        change(&ids, id)
+        let ids = CalendarSelection.toggled(try context.loadConfig().calendars, id: id, enabled: enabled)
         // JSON-массив, а не список через запятую: id календаря — непрозрачная строка EventKit.
         let value = Output.render(.array(ids.map(JSONValue.string)), pretty: false)
         return try await send(

@@ -50,10 +50,6 @@ final class SchedulerDriver {
     }
 
     func start() {
-        calendar.onChange = { [weak self] in
-            self?.reload()
-            Task { await self?.tick() }
-        }
         reload()
         // Монитор созвона один на app и работает всегда, а не только во время записи: re-arm (§5 п.5)
         // стартует запись по появлению созвона, когда ничего не пишется. Сэмпл без записи (и поздний,
@@ -83,6 +79,13 @@ final class SchedulerDriver {
                 }
             },
         ]
+    }
+
+    /// Календарь или права изменились (CalendarService.onChange, его раздаёт AppModel):
+    /// перечитываем и решаем сразу, не дожидаясь минутного перечитывания.
+    func calendarsChanged() {
+        reload()
+        Task { [weak self] in await self?.tick() }
     }
 
     /// `now` параметром — чтобы тик можно было прогнать руками; таймер зовёт с дефолтом.

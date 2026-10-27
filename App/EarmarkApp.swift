@@ -19,6 +19,10 @@ struct EarmarkApp: App {
                 Image(systemName: "ear")
             }
         }
+
+        Settings {
+            SettingsView(model: delegate.model)
+        }
     }
 }
 

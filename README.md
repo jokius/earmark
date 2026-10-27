@@ -99,6 +99,8 @@ certificate's `OU` field, not from the parentheses in its name — those are dif
    earmark upcoming                  # what will be recorded in the next 24 hours
    ```
 
+   Or check them in Settings… (⌘,) in the earmark menu; the CLI keeps working the same way.
+
 4. Get the model (1.6 GB): `earmark model download`, or `earmark model import <path>` if you
    already have `ggml-large-v3-turbo.bin` (it is checked by SHA-256 and cloned, not copied, on APFS).
 5. Check everything: `earmark doctor --audio-test`.

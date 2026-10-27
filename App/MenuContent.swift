@@ -6,6 +6,7 @@ import SwiftUI
 /// и у IPC одна точка входа.
 struct MenuContent: View {
     let model: AppModel
+    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         if model.isRecording {
@@ -32,20 +33,19 @@ struct MenuContent: View {
         Divider()
 
         Button("Open Recordings Folder") { model.openRecordingsFolder() }
+        Button("Settings…") {
+            openSettings()
+            // Без activate окно LSUIElement-приложения не выходит вперёд и не становится key
+            // (так же в Call Reminder).
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        .keyboardShortcut(",")
         #if DEBUG
-        // Ручные проверки до появления IPC; результат — в `/usr/bin/log stream`, категория audio-test.
+        // Ручная проверка; результат — в `/usr/bin/log stream`, категория audio-test.
         Menu("Debug") {
             Button("Run Audio Self-Test (plays a short quiet tone)") {
                 Task { _ = try? await model.audioTest() }
             }
-            Divider()
-            ForEach(model.calendarsList(), id: \.id) { item in
-                Toggle(
-                    "\(item.title) — \(item.account)",
-                    isOn: Binding(
-                        get: { item.enabled }, set: { model.debugSetCalendar(item.id, enabled: $0) }))
-            }
-            Button("Reset Enabled Calendars") { _ = try? model.resetConfig("calendars") }
         }
         #endif
 

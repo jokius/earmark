@@ -98,6 +98,8 @@ DEVELOPMENT_TEAM = <поле OU сертификата>
    earmark upcoming                  # что запишется в ближайшие 24 часа
    ```
 
+   Или отметьте их в окне Settings… (⌘,) в меню earmark — CLI работает как прежде.
+
 4. Модель (1,6 ГБ): `earmark model download` или `earmark model import <путь>`, если
    `ggml-large-v3-turbo.bin` уже есть (сверяется по SHA-256 и на APFS клонируется, а не копируется).
 5. Проверьте всё разом: `earmark doctor --audio-test`.

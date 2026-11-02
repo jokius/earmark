@@ -30,6 +30,7 @@ public enum Registry {
             "status": AppCommands.status,
             "start": AppCommands.start,
             "stop": AppCommands.stop,
+            "move": AppCommands.move,
             "upcoming": AppCommands.upcoming,
             "calendars": AppCommands.calendars,
             "calendars enable": AppCommands.enableCalendar,

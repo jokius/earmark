@@ -32,6 +32,11 @@ final class RecordingSession {
     /// Запись началась, ручная или авто. Зовётся раньше предупреждений `capture_failed` этого старта.
     @ObservationIgnored var onStarted: (() -> Void)?
     @ObservationIgnored var onWarning: ((String) -> Void)?
+    /// Записи от стопа до onFinalized/onDiscarded. Сведение пишет meta.json и снимает manifest ещё в
+    /// фоне, до прыжка на main actor: в этом зазоре скан очереди видит обычную recorded-запись и начал
+    /// бы расшифровывать её в Manual раньше вопроса о проекте. Снимается в одном ходе main actor с
+    /// onFinalized, так что удержание переходит к вопросу без щели.
+    @ObservationIgnored private(set) var finalizing: Set<String> = []
 
     /// Уровни каналов для CallActivityMonitor: он читает их со своей очереди, без main actor.
     /// Рекордеры отдают 0, пока не пишут, поэтому при простое здесь (0, 0).
@@ -189,6 +194,7 @@ final class RecordingSession {
         let manifest = finished.manifest
         let callApps = finished.tracker.callAppsSeen
         let endedAt = Date()
+        finalizing.insert(manifest.id)
         return Task.detached(priority: .userInitiated) { [weak self] in
             let result = Result { () throws -> RecordingMeta? in
                 try RecordingFinalizer.finalize(
@@ -271,6 +277,8 @@ final class RecordingSession {
     private func finalized(
         _ result: Result<RecordingMeta?, any Error>, folder: URL, id: String, reason: StopReason
     ) {
+        // До колбэков и на любой ветке: после сбоя запись держит manifest, и очередь её и так не возьмёт.
+        finalizing.remove(id)
         switch result {
         case .success(let meta?):
             Self.log.info("recording \(id, privacy: .public) finalized: \(reason.rawValue, privacy: .public)")

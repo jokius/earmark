@@ -8,7 +8,7 @@ struct CommandTableTests {
     /// Все команды спеки §9.3 — таблица обязана содержать ровно их.
     private let specPaths = [
         "status", "start", "stop", "upcoming", "calendars", "calendars enable", "calendars disable",
-        "recordings", "recording", "transcript", "transcribe", "model status", "model download",
+        "recordings", "recording", "move", "transcript", "transcribe", "model status", "model download",
         "model import",
         "config list", "config get", "config set", "config reset", "doctor", "permissions request", "mcp",
         "help",
@@ -69,6 +69,17 @@ struct CommandTableTests {
             (
                 ["model", "import", "/tmp/m.bin"],
                 ParsedCommand(path: ["model", "import"], arguments: ["path": "/tmp/m.bin"])
+            ),
+            (
+                ["move", "20261002-1400-a1b2", "--calendar", "cal-work"],
+                ParsedCommand(
+                    path: ["move"], arguments: ["id": "20261002-1400-a1b2"],
+                    options: ["calendar": "cal-work"])
+            ),
+            (
+                ["move", "20261002-1400-a1b2", "--manual"],
+                ParsedCommand(
+                    path: ["move"], arguments: ["id": "20261002-1400-a1b2"], options: ["manual": "true"])
             ),
             (["help", "--json"], ParsedCommand(path: ["help"], options: ["json": "true"])),
             ([], ParsedCommand(path: ["help"])),
@@ -132,7 +143,7 @@ struct CommandTableTests {
         #expect(
             needs == [
                 "start", "upcoming", "calendars", "calendars enable", "calendars disable",
-                "transcribe",
+                "move", "transcribe",
                 "config set", "config reset", "doctor", "permissions request",
             ])
     }

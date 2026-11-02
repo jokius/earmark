@@ -14,8 +14,8 @@ struct MCPToolTableTests {
         #expect(
             tools.compactMap { $0["name"]?.stringValue } == [
                 "get_status", "start_recording", "stop_recording", "list_upcoming_events", "list_calendars",
-                "set_calendar_enabled", "list_recordings", "get_recording", "get_transcript",
-                "transcribe_recording",
+                "set_calendar_enabled", "list_recordings", "get_recording", "move_recording",
+                "get_transcript", "transcribe_recording",
                 "get_config", "set_config", "reset_config", "doctor",
             ])
         let readOnly = Set(
@@ -41,6 +41,13 @@ struct MCPToolTableTests {
         guard case .object(let properties) = recordings else { return }
         #expect(Set(properties.keys) == ["since", "until", "calendar", "status", "limit"])
         #expect(byName["get_recording"]?["inputSchema"]?["required"] == ["id"])
+        let move = try #require(byName["move_recording"]?["inputSchema"])
+        #expect(move["required"] == ["id"])
+        #expect(move["properties"]?["manual"]?["type"] == "boolean")
+        #expect(move["properties"]?["calendar"]?["type"] == "string")
+        if case .object(let properties)? = move["properties"] {
+            #expect(Set(properties.keys) == ["id", "calendar", "manual"])
+        }
         #expect(byName["transcribe_recording"]?["inputSchema"]?["properties"]?["now"] == nil)
         #expect(byName["doctor"]?["inputSchema"]?["properties"]?["audio_test"]?["type"] == "boolean")
         #expect(byName["get_config"]?["inputSchema"]?["required"] == nil)
@@ -96,6 +103,17 @@ struct MCPToolTableTests {
                 "transcribe_recording", ["id": "20261002-1400-a1b2", "force": true],
                 ParsedCommand(
                     path: ["transcribe"], arguments: ["id": "20261002-1400-a1b2"], options: ["force": "true"])
+            ),
+            ToolCase(
+                "move_recording", ["id": "20261002-1400-a1b2", "calendar": "cal-work"],
+                ParsedCommand(
+                    path: ["move"], arguments: ["id": "20261002-1400-a1b2"],
+                    options: ["calendar": "cal-work"])
+            ),
+            ToolCase(
+                "move_recording", ["id": "20261002-1400-a1b2", "manual": true],
+                ParsedCommand(
+                    path: ["move"], arguments: ["id": "20261002-1400-a1b2"], options: ["manual": "true"])
             ),
             ToolCase(
                 "doctor", ["audio_test": true],

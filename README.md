@@ -123,6 +123,13 @@ Recordings go to `~/Earmark`, created with mode 0700. Change it with
 `earmark config set recordings_dir <path>`. Desktop, Documents and Downloads are refused: macOS
 guards them, and every script that reads your recordings would hit permission prompts.
 
+A manual recording made outside any calendar event goes to `Manual`. Once it is finalized, a small
+floating window asks "Which project is this call for?" with a button for every enabled calendar:
+pick one and the recording moves into that calendar's folder, gets tagged with it and is
+transcribed in that calendar's languages. **Keep in Manual** or closing the window leaves it where
+it is. The window does not take focus from your call, and transcription waits for the answer. From
+the CLI: `earmark move <id> --calendar <id>` or `earmark move <id> --manual`.
+
 ## CLI
 
 Every command prints JSON. Success goes to stdout as
@@ -135,6 +142,7 @@ to stderr as `{"schema_version":1,"error":{"code":"…","message":"…","exit_co
 | `earmark status` | State, current recording, next auto-recording, permissions, queue, warnings. Never launches the app: prints `"app_running": false` instead |
 | `earmark start [--title T]` | Start a manual recording. Idempotent: returns the running recording if there is one |
 | `earmark stop` | Stop and finalize; answers once `audio.m4a` is written. Never launches the app: with the app quit nothing is recording, so it answers `null` |
+| `earmark move <id> --calendar ID`, `earmark move <id> --manual` | File a manual recording under a calendar: it moves into the calendar's folder and gets its `calendar`. `--manual` moves it back. Transcripts are kept; `earmark transcribe <id> --force` redoes them in the calendar's languages |
 | `earmark upcoming [--hours 24]` | Events that will be recorded |
 | `earmark calendars` | Calendars with `enabled`, account and folder |
 | `earmark calendars enable <id>`, `earmark calendars disable <id>` | Turn auto-recording on or off for a calendar |
@@ -151,7 +159,7 @@ to stderr as `{"schema_version":1,"error":{"code":"…","message":"…","exit_co
 | `earmark mcp` | stdio MCP server |
 | `earmark help [--json]` | The command table |
 
-Commands that need the app — start, upcoming, calendars, `config set` and `config reset`,
+Commands that need the app — start, move, upcoming, calendars, `config set` and `config reset`,
 `transcribe` without `--now`, doctor and `permissions request` — launch it with
 `open -g -b com.konayre.earmark` when it is not running and wait up to 5 seconds. Everything else
 reads plain files and works without the app.

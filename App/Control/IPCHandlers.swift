@@ -8,6 +8,7 @@ import os
 /// | status | — | StatusData |
 /// | recording.start | `title?` | CurrentRecordingInfo |
 /// | recording.stop | — | RecordingMeta или null (discard) |
+/// | recording.move | `id`, `calendar_id` (строка; null или нет — Manual) | `{id, path, calendar}` |
 /// | calendar.list | — | [CalendarListItem] |
 /// | calendar.upcoming | `hours?` (1…168, по умолчанию 24) | [UpcomingItem] |
 /// | config.set | `key`, `value` (строка, как из CLI) | `{key, old, new}` |
@@ -21,11 +22,14 @@ import os
 @MainActor
 enum IPCHandlers {
     private static let logger = Logger(subsystem: EarmarkPaths.bundleID, category: "ipc")
+    private static let journaled: Set<String> = [
+        IPCMethod.recordingStart, IPCMethod.recordingStop, IPCMethod.recordingMove,
+    ]
 
     static func handle(_ request: IPCRequest, peer: pid_t, model: AppModel) async -> IPCResponse {
-        // Старт и стоп записи из CLI или агента — действия с последствиями для приватности:
+        // Старт, стоп и перенос записи из CLI или агента — действия с последствиями для приватности:
         // кто попросил, остаётся в журнале (§9.2).
-        if request.method == IPCMethod.recordingStart || request.method == IPCMethod.recordingStop {
+        if journaled.contains(request.method) {
             logger.notice("\(request.method, privacy: .public) from pid \(peer, privacy: .public)")
         }
         do {
@@ -47,6 +51,8 @@ enum IPCHandlers {
             return try encode(try model.startManual(title: params["title"]?.stringValue))
         case IPCMethod.recordingStop:
             return try encode(try await model.stopRecording())
+        case IPCMethod.recordingMove:
+            return try model.moveRecording(id: try string(params, "id"), calendarID: try calendarID(params))
         case IPCMethod.calendarList:
             return try encode(model.calendarsList())
         case IPCMethod.calendarUpcoming:
@@ -77,6 +83,15 @@ enum IPCHandlers {
             throw EarmarkError.invalidArguments("missing string param \"\(key)\"")
         }
         return value
+    }
+
+    /// null или нет ключа — Manual. Число или объект от сломанного клиента — ошибка, а не тихий Manual.
+    private static func calendarID(_ params: JSONValue) throws(EarmarkError) -> String? {
+        guard let raw = params["calendar_id"], raw != .null else { return nil }
+        guard let id = raw.stringValue else {
+            throw EarmarkError.invalidArguments("calendar_id must be a string or null")
+        }
+        return id
     }
 
     private static func hours(_ params: JSONValue) throws(EarmarkError) -> Int {

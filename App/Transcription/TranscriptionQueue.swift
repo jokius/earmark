@@ -41,6 +41,9 @@ final class TranscriptionQueue {
     private let store: () -> RecordingStore
     private let config: () -> Config
     private let isRecording: () -> Bool
+    /// Запись, которую ещё сводят, или ручная, по которой не ответили «какой проект?»: из бэклога её
+    /// не берём, иначе расшифровка пошла бы не на тех языках и в папке, откуда запись сейчас уедет.
+    private let isHeld: (String) -> Bool
     private let provisioner: ModelProvisioner
     private let worker: URL?
     private var running: Job?
@@ -61,11 +64,13 @@ final class TranscriptionQueue {
 
     init(
         store: @escaping () -> RecordingStore, config: @escaping () -> Config,
-        isRecording: @escaping () -> Bool, provisioner: ModelProvisioner, worker: URL?
+        isRecording: @escaping () -> Bool, isHeld: @escaping (String) -> Bool, provisioner: ModelProvisioner,
+        worker: URL?
     ) {
         self.store = store
         self.config = config
         self.isRecording = isRecording
+        self.isHeld = isHeld
         self.provisioner = provisioner
         self.worker = worker
     }
@@ -202,7 +207,8 @@ final class TranscriptionQueue {
             return nil
         }
         pendingCount = pending.count
-        guard let id = pending.compactMap(\.id).first(where: { cooldown[$0] == nil }) else {
+        // Удержанные пропускаем только здесь: явный `earmark transcribe <id>` — решение человека.
+        guard let id = pending.compactMap(\.id).first(where: { cooldown[$0] == nil && !isHeld($0) }) else {
             needsScan = false
             return nil
         }

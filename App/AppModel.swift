@@ -29,6 +29,10 @@ final class AppModel {
     /// Предупреждения записи (`capture_failed:…`, `far_end_digital_silence`, `start_failed:…`,
     /// `finalize_failed:…`) — в status.warnings. Сбрасываются на каждом старте записи.
     private(set) var recordingWarnings: [String] = []
+    /// Ручные записи, по которым ждём ответа «какой проект?», по порядку остановки. Очередь не берёт
+    /// их из бэклога. Только в памяти: после перезапуска запись просто расшифруется в Manual.
+    private(set) var awaitingProject: [String] = []
+    @ObservationIgnored private lazy var projectPanels = ProjectPanels(model: self)
 
     var isRecording: Bool { session.isRecording }
 
@@ -130,13 +134,21 @@ final class AppModel {
             store: { [weak self] in RecordingStore(root: (self?.config ?? Config()).recordingsDir) },
             config: { [weak self] in self?.config ?? Config() },
             isRecording: { [weak self] in self?.session.isRecording ?? false },
+            // Держим, пока запись сводится, и дальше, пока ждёт ответа «какой проект?»: finalizing
+            // снимается в одном ходе с onFinalized, а тот сразу кладёт запись в awaitingProject.
+            isHeld: { [weak self] id in
+                guard let self else { return false }
+                return self.session.finalizing.contains(id) || self.awaitingProject.contains(id)
+            },
             provisioner: provisioner, worker: Self.cliExecutable)
         self.queue = queue
         provisioner.onReady = { [weak queue] in queue?.requestScan() }
-        // Колбэки сеанса — только здесь (D33). onFinalized один на двоих: re-arm смотрит причину
-        // стопа, очередь ставит запись в работу.
-        session.onFinalized = { [weak scheduler, weak queue] _, meta in
+        // Колбэки сеанса — только здесь (D33). onFinalized один на троих: re-arm смотрит причину
+        // стопа, вопрос о проекте удерживает ручную запись, очередь ставит запись в работу. Вопрос —
+        // раньше скана: иначе очередь успела бы взять запись до удержания.
+        session.onFinalized = { [weak self, weak scheduler, weak queue] _, meta in
             scheduler?.recordingFinalized(meta)
+            self?.recordingFinalized(meta)
             queue?.requestScan()
         }
         session.onDiscarded = { [weak scheduler] id, reason in
@@ -224,6 +236,70 @@ final class AppModel {
         }
         guard let queue else { throw EarmarkError.unavailable("transcription queue is not running") }
         return try queue.enqueue(id: id, force: force)
+    }
+
+    // MARK: - проект ручной записи
+
+    /// Ручная запись вне событий сведена: спросить, к какому календарю она относится. Нечего
+    /// предложить (ни одного включённого календаря в EventKit) — не спрашиваем.
+    func recordingFinalized(_ meta: RecordingMeta) {
+        guard meta.needsProject, !awaitingProject.contains(meta.id) else { return }
+        let calendars = projectCalendars()
+        guard !calendars.isEmpty else { return }
+        awaitingProject.append(meta.id)
+        projectPanels.show(meta, calendars: calendars)
+    }
+
+    /// Включённые календари в порядке config.calendars (это и приоритет) — кнопки вопроса о проекте.
+    func projectCalendars() -> [CalendarListItem] {
+        let all = calendarsList()
+        return config.calendars.compactMap { id in all.first { $0.id == id } }
+    }
+
+    /// Панель, CLI и агент. nil — обратно в Manual. Ответ — `{id, path, calendar}`.
+    func moveRecording(id: String, calendarID: String?) throws(EarmarkError) -> JSONValue {
+        var calendar: CalendarRef?
+        var folder: String?
+        if let calendarID {
+            let all = calendarService.calendars()
+            guard let info = all.first(where: { $0.id == calendarID }) else {
+                throw EarmarkError.notFound("no calendar \(calendarID); take ids from `earmark calendars`")
+            }
+            calendar = CalendarRef(id: info.id, title: info.title)
+            folder = RecordingStore.calendarFolderName(
+                for: info, override: config.folderOverride(forCalendar: info.id), allCalendars: all)
+        }
+        // meta.json уже на диске, а onFinalized ещё не пришёл: store.move прошёл бы, а следом
+        // recordingFinalized открыл бы вопрос по старой meta для уже переложенной записи.
+        if session.finalizing.contains(id) {
+            throw EarmarkError.busy("recording \(id) is still in progress")
+        }
+        // Воркер этой записи держит .transcribe.lock, и store.move ответил бы тем же busy — но с
+        // текстом про чужой процесс. Здесь мы знаем, что воркер наш.
+        if queue?.runningID == id {
+            throw EarmarkError.busy(
+                "recording \(id) is being transcribed; move it when transcription finishes")
+        }
+        let moved = try RecordingStore(root: config.recordingsDir).move(id: id, to: calendar, folder: folder)
+        stopAwaitingProject(id)
+        let ref = moved.meta?.calendar
+        return .object([
+            "id": .string(id), "path": .string(moved.url.path),
+            "calendar": ref.map { .object(["id": .string($0.id), "title": .string($0.title)]) } ?? .null,
+        ])
+    }
+
+    /// «Keep in Manual» и крестик панели: запись остаётся на месте и уходит в очередь.
+    func keepInManual(id: String) {
+        stopAwaitingProject(id)
+    }
+
+    /// Любой ответ снимает удержание: панель закрывается (и та, что открыта, когда ответили из CLI),
+    /// очередь сканирует заново.
+    private func stopAwaitingProject(_ id: String) {
+        awaitingProject.removeAll { $0 == id }
+        projectPanels.close(id)
+        queue?.requestScan()
     }
 
     // MARK: - права

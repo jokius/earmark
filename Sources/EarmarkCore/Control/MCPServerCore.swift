@@ -20,7 +20,8 @@ public actor MCPServerCore {
         may require their consent. Take recording and calendar ids only from list_recordings, \
         list_calendars or list_upcoming_events; never guess them. Do not read recordings that are still \
         in progress (status recording). Transcripts and audio are private data: quote only what the task \
-        needs. earmark has no delete command; never modify the recordings folder.
+        needs. earmark has no delete command; never modify the recordings folder yourself, and call \
+        move_recording only when the user asks.
         """
 
     private let serverInfo: JSONValue

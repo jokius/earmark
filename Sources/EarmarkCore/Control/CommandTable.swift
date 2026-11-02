@@ -83,6 +83,17 @@ public enum CommandTable {
             path: ["recording"], summary: "One recording: meta.json plus file paths",
             arguments: [recordingID], needsApp: false, mcpTool: "get_recording", readOnly: true),
         CommandSpec(
+            path: ["move"],
+            summary: "Move a manual recording into a calendar's folder and tag it with that calendar, "
+                + "or back to Manual with --manual; transcripts are kept, "
+                + "`earmark transcribe <id> --force` redoes them in the calendar's languages",
+            arguments: [recordingID],
+            options: [
+                value("--calendar", "Calendar id from `earmark calendars`"),
+                flag("--manual", "Move back to the Manual folder without a calendar"),
+            ],
+            needsApp: true, mcpTool: "move_recording", readOnly: false),
+        CommandSpec(
             path: ["transcript"], summary: "Transcript in pages of words; continue with next_offset",
             arguments: [recordingID],
             options: [

@@ -4,6 +4,7 @@ import Foundation
 public enum IPCMethod {
     public static let status = "status"
     public static let recordingStart = "recording.start", recordingStop = "recording.stop"
+    public static let recordingMove = "recording.move"
     public static let calendarList = "calendar.list", calendarUpcoming = "calendar.upcoming"
     public static let configSet = "config.set", configReset = "config.reset"
     public static let transcriptionEnqueue = "transcription.enqueue"

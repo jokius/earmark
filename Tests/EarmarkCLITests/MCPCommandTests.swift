@@ -118,6 +118,32 @@ struct MCPCommandTests {
         #expect(harness.launchCount == 1)
     }
 
+    @Test("move_recording: в app уходит recording.move с id и calendar_id; manual — calendar_id не строка")
+    func moveRecordingReachesApp() async throws {
+        let harness = try CLIHarness()
+        let id = "20261002-1400-a1b2"
+        let reply: JSONValue = [
+            "id": .string(id), "path": "/rec/Work/2026-10-02 14-00 Idea",
+            "calendar": ["id": "cal-work", "title": "Work"],
+        ]
+        let app = try harness.startApp { _ in .success(reply) }
+        let replies = try await converse(
+            [
+                rpc(1, "initialize", .object(["protocolVersion": .string("2025-06-18")])),
+                call(2, "move_recording", ["id": .string(id), "calendar": "cal-work"]),
+                call(3, "move_recording", ["id": .string(id), "manual": true]),
+            ], harness)
+
+        #expect(replies.count == 3)
+        #expect(replies[1]["result"]?["isError"] == .bool(false))
+        #expect(try toolData(replies[1]) == reply)
+        #expect(app.requests.map(\.method) == [IPCMethod.recordingMove, IPCMethod.recordingMove])
+        #expect(app.requests.first?.params == ["id": .string(id), "calendar_id": "cal-work"])
+        let manual = app.requests.dropFirst().first?.params
+        #expect(manual?["id"] == .string(id))
+        #expect(manual?["calendar_id"] == nil || manual?["calendar_id"] == .null)
+    }
+
     /// Байты stdin по одному: так строка гарантированно приходит частями, как из настоящего пайпа.
     private func bytes(_ text: String) -> AsyncStream<UInt8> {
         AsyncStream { continuation in

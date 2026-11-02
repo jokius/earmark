@@ -140,6 +140,23 @@ enum AppCommands {
         return try await send(IPCMethod.transcriptionEnqueue, params, context)
     }
 
+    /// Ручная запись → папка календаря (или обратно в Manual) через app: он держит очередь транскрипции
+    /// и вопрос о проекте. Пустой --calendar — ошибка, а не Manual: опечатка в скрипте агента не должна
+    /// молча снять календарь.
+    static func move(
+        _ parsed: ParsedCommand, _ context: CLIContext
+    ) async throws(EarmarkError) -> JSONValue {
+        let id = try parsed.argument("id")
+        let calendarID: JSONValue
+        switch (parsed.options["calendar"], parsed.flag("manual")) {
+        case (let calendar?, false) where !calendar.isEmpty: calendarID = .string(calendar)
+        case (nil, true): calendarID = .null
+        default: throw .invalidArguments("pass exactly one of --calendar <id> or --manual")
+        }
+        return try await send(
+            IPCMethod.recordingMove, .object(["id": .string(id), "calendar_id": calendarID]), context)
+    }
+
     /// enable/disable — это `config set calendars` с новым списком, своих IPC-методов у них нет.
     /// Список берём с диска: app — единственный писатель config.json и пишет его атомарно,
     /// так что на диске то же, что у app в памяти. Правило списка (порядок = приоритет) — общее

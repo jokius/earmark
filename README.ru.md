@@ -122,6 +122,12 @@ DEVELOPMENT_TEAM = <поле OU сертификата>
 `earmark config set recordings_dir <путь>`. Desktop, Documents и Downloads не принимаются: их
 охраняет macOS, и любой скрипт, читающий записи, упирался бы в запросы прав.
 
+Ручная запись вне событий календаря ложится в `Manual`. Когда она сведена, маленькое плавающее окно
+спрашивает «Which project is this call for?» — с кнопкой на каждый включённый календарь: выбранный
+календарь забирает запись в свою папку, ставит ей свой `calendar`, и расшифровка идёт на его языках.
+**Keep in Manual** или закрытие окна оставляют запись на месте. Окно не отбирает фокус у созвона,
+а расшифровка ждёт ответа. Из CLI: `earmark move <id> --calendar <id>` или `earmark move <id> --manual`.
+
 ## CLI
 
 Каждая команда печатает JSON. Успех — в stdout:
@@ -134,6 +140,7 @@ DEVELOPMENT_TEAM = <поле OU сертификата>
 | `earmark status` | Состояние, текущая запись, ближайшая авто-запись, права, очередь, предупреждения. App не поднимает: вместо этого `"app_running": false` |
 | `earmark start [--title T]` | Начать ручную запись. Идемпотентно: если запись идёт, вернёт её |
 | `earmark stop` | Остановить и свести; отвечает, когда `audio.m4a` уже записан. App не поднимает: в закрытом app ничего не пишется, ответ — `null` |
+| `earmark move <id> --calendar ID`, `earmark move <id> --manual` | Отнести ручную запись к календарю: она переезжает в его папку и получает его `calendar`. `--manual` возвращает обратно. Транскрипты остаются; `earmark transcribe <id> --force` переделает их на языках календаря |
 | `earmark upcoming [--hours 24]` | События, которые будут записаны |
 | `earmark calendars` | Календари с `enabled`, аккаунтом и папкой |
 | `earmark calendars enable <id>`, `earmark calendars disable <id>` | Включить или выключить авто-запись календаря |
@@ -150,7 +157,7 @@ DEVELOPMENT_TEAM = <поле OU сертификата>
 | `earmark mcp` | stdio MCP-сервер |
 | `earmark help [--json]` | Таблица команд |
 
-Командам, которым нужен app, — start, upcoming, calendars, `config set` и `config reset`,
+Командам, которым нужен app, — start, move, upcoming, calendars, `config set` и `config reset`,
 `transcribe` без `--now`, doctor и `permissions request` — CLI сам поднимает его через
 `open -g -b com.konayre.earmark` и ждёт до 5 секунд. Остальные читают обычные файлы и работают
 без app.

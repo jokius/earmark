@@ -4,8 +4,8 @@ description: >-
   Drive earmark, the local call recorder in the macOS menu bar, through its `earmark` CLI.
   Use when the user asks to record a call or meeting, start or stop a recording, check what
   earmark is doing, see which upcoming calendar events will be recorded automatically, find
-  meeting recordings, read or search a call transcript, turn auto-recording on or off for a
-  calendar, or change earmark settings.
+  meeting recordings, read or search a call transcript, file a manual recording under a calendar,
+  turn auto-recording on or off for a calendar, or change earmark settings.
 ---
 
 # earmark
@@ -26,13 +26,16 @@ Run it first and use only the commands and options it lists. Do not guess flags 
 - "What will be recorded today?" — `earmark upcoming`.
 - "What did we agree on in yesterday's sync?" — `earmark recordings`, then `earmark transcript <id>`.
 - "Record my Work calendar", "transcribe in Russian" — `earmark calendars …`, `earmark config set …`.
+- "That last call was for Work", "put it back in Manual" — `earmark move <id> --calendar <id>`,
+  `earmark move <id> --manual`.
 
 ## Rules
 
 - Start a recording only when the user explicitly asks for it in this conversation. Recording
   other people may require their consent; never start one on your own initiative.
-- Never delete, move or edit anything in the recordings folder. earmark has no delete command
-  on purpose.
+- Never delete or edit anything in the recordings folder, and never move files there by hand.
+  earmark has no delete command on purpose. `earmark move` files a manual recording under a
+  calendar; run it only when the user asks.
 - Take recording ids from `earmark recordings` output. Never guess or construct an id.
 - A recording is complete only when its status is not `recording`; a transcript is ready only
   when the status is `transcribed`. Do not read `*.caf` or `*.partial.*` files.

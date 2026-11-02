@@ -48,6 +48,15 @@ struct ConfigSchemaTests {
             ("transcription.language", "auto", .string("auto")),
             ("transcription.language", "ru", .string("ru")),
             ("transcription.language", "haw", .string("haw")),
+            // Значение языка нормализуется через TranscriptionLanguage: регистр, пробелы, повторы.
+            ("transcription.language", "RU", .string("ru")),
+            ("transcription.language", "Auto", .string("auto")),
+            ("transcription.language", " RU, en ", .string("ru,en")),
+            ("transcription.language", "ru,en,az,en", .string("ru,en,az")),
+            ("transcription.language", "ru,ru", .string("ru")),
+            ("calendar.CAL-1.language", "ru,EN, az", .string("ru,en,az")),
+            ("calendar.CAL-1.language", " EN ", .string("en")),
+            ("calendar.CAL-1.language", "auto", .string("auto")),
             ("transcript.label_me", " Я ", .string("Я")),
         ])
     func parses(key: String, raw: String, expected: ConfigValue) throws {
@@ -71,8 +80,14 @@ struct ConfigSchemaTests {
             ("calendar.CAL-1.folder", "a:b"),
             ("calendar.CAL-1.folder", ".."),
             ("transcription.language", "russian"),
-            ("transcription.language", "RU"),
             ("transcription.language", "r"),
+            ("transcription.language", "auto,ru"),
+            ("transcription.language", "ru,xx"),
+            ("transcription.language", " , "),
+            ("calendar.CAL-1.language", ""),
+            ("calendar.CAL-1.language", "english"),
+            ("calendar.CAL-1.language", "ru,auto"),
+            ("calendar.CAL-1.language", "ru;en"),
             ("transcript.label_them", "   "),
             ("recordings_dir", "relative/dir"),
             ("recordings_dir", "/System/earmark-test"),
@@ -202,8 +217,48 @@ struct ConfigSchemaTests {
 
     @Test(
         "неизвестные ключи и сами шаблоны — unknownKey",
-        arguments: ["nope", "calendar.CAL-1.color", "calendar.*.folder", "calendar..folder", "stop"])
+        arguments: [
+            "nope", "calendar.CAL-1.color", "calendar.*.folder", "calendar..folder", "stop",
+            "calendar.*.language", "calendar..language",
+        ])
     func unknownKeys(key: String) {
         #expect(throws: ConfigError.unknownKey(key)) { try ConfigSchema.parse("1", for: key) }
+    }
+
+    @Test(
+        "невалидный язык — причина перечисляет допустимые формы",
+        arguments: [
+            ("transcription.language", "english"), ("calendar.CAL-1.language", "auto,ru"),
+        ])
+    func languageRejectionReason(key: String, raw: String) {
+        let error = #expect(throws: ConfigError.self) { try ConfigSchema.parse(raw, for: key) }
+        guard case .invalidValue(_, let reason)? = error else {
+            Issue.record("ожидали invalidValue, получили \(String(describing: error))")
+            return
+        }
+        #expect(reason.contains("expected auto, a whisper language code or a comma-separated list of codes"))
+    }
+
+    /// help ключей агент читает из `earmark help --json`: там и проверяем текст и тип.
+    @Test(
+        "help --json: transcription.language описывает список, calendar.*.language — переопределение",
+        arguments: [
+            (
+                "transcription.language",
+                "Whisper language: auto, a code (ru) or a comma-separated list (ru,en,az) picked per speech fragment"
+            ),
+            ("calendar.*.language", "Per-calendar override of transcription.language"),
+        ])
+    func languageHelp(key: String, help: String) throws {
+        guard case .array(let keys)? = CommandTable.helpJSON()["config_keys"] else {
+            Issue.record("нет config_keys")
+            return
+        }
+        let entry = try #require(keys.first { $0["key"] == .string(key) }, "нет \(key) в config_keys")
+        guard case .object(let fields) = entry else {
+            Issue.record("\(key): не объект")
+            return
+        }
+        #expect(fields.values.contains(.string(help)), "\(key): нет help «\(help)»")
     }
 }

@@ -16,6 +16,7 @@ public enum ConfigSchema {
         spec(
             "calendar.*.folder", .string, nil,
             "Folder name for this calendar's recordings instead of its title"),
+        spec("calendar.*.language", .string, nil, "Per-calendar override of transcription.language"),
         spec(
             "stop.call_end_seconds", .int, .int(60), "Stop after the call app released the mic this long",
             5...3600),
@@ -39,12 +40,13 @@ public enum ConfigSchema {
         spec("transcription.enabled", .bool, .bool(true), "Transcribe recordings locally with whisper"),
         spec(
             "transcription.language", .string, .string("auto"),
-            "Whisper language code (ru, en, az, ...) or auto"),
+            "Whisper language: auto, a code (ru) or a comma-separated list (ru,en,az) picked per speech fragment"
+        ),
         spec("transcript.label_me", .string, .string("Me"), "Speaker label for the microphone channel"),
         spec("transcript.label_them", .string, .string("Them"), "Speaker label for the system audio channel"),
     ]
 
-    /// Ищет точный ключ или шаблон calendar.<id>.lead_seconds|folder.
+    /// Ищет точный ключ или шаблон calendar.<id>.lead_seconds|folder|language.
     public static func spec(for key: String) -> ConfigKeySpec? {
         // "*" — только в шаблонах: сам шаблон задать нельзя
         guard !key.contains("*") else { return nil }
@@ -84,7 +86,7 @@ public enum ConfigSchema {
     static func calendarTemplate(for key: String) -> String? {
         let prefix = "calendar."
         guard key.hasPrefix(prefix) else { return nil }
-        for field in [".lead_seconds", ".folder"] where key.hasSuffix(field) {
+        for field in [".lead_seconds", ".folder", ".language"] where key.hasSuffix(field) {
             // id между префиксом и полем не пустой: "calendar..folder" — опечатка, а не ключ
             guard key.count > prefix.count + field.count else { return nil }
             return "calendar.*" + field
@@ -109,8 +111,7 @@ public enum ConfigSchema {
         case (.path, .string(let path)):
             return .string(try normalizedPath(path, key: key))
         case (.string, .string(let text)):
-            try checkString(text, key: key)
-            return value
+            return .string(try checkString(text, key: key))
         default:
             throw .invalidValue(key: key, reason: "expected \(spec.type.rawValue)")
         }
@@ -138,19 +139,25 @@ public enum ConfigSchema {
         return items.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
     }
 
-    private static func checkString(_ text: String, key: String) throws(ConfigError) {
+    /// Возвращает значение к сохранению: язык — в канонической форме, чтобы " RU, en " из CLI
+    /// и "ru,en" из config.json были одним значением.
+    private static func checkString(_ text: String, key: String) throws(ConfigError) -> String {
         let hasControl = text.unicodeScalars.contains { $0.properties.generalCategory == .control }
-        switch key {
-        case "transcription.language":
-            guard text == "auto" || text.wholeMatch(of: /[a-z]{2,3}/) != nil else {
-                throw .invalidValue(key: key, reason: "expected auto or a 2-3 letter lowercase language code")
+        if key == "transcription.language" || calendarTemplate(for: key) == "calendar.*.language" {
+            guard let language = TranscriptionLanguage(text) else {
+                throw .invalidValue(
+                    key: key,
+                    reason: "expected auto, a whisper language code or a comma-separated list of codes")
             }
+            return language.raw
+        }
+        switch key {
         case "transcript.label_me", "transcript.label_them":
             guard !text.isEmpty, !hasControl else {
                 throw .invalidValue(key: key, reason: "expected a non-empty single-line label")
             }
         default:
-            guard calendarTemplate(for: key) == "calendar.*.folder" else { return }
+            guard calendarTemplate(for: key) == "calendar.*.folder" else { return text }
             // одно имя папки внутри recordings_dir: без "/" и без выхода наружу через ".."
             guard !text.isEmpty, !text.contains("/"), !text.contains(":"), !text.hasPrefix("."), !hasControl
             else {
@@ -159,6 +166,7 @@ public enum ConfigSchema {
                     reason: "expected a folder name without \"/\" or \":\" that does not start with \".\"")
             }
         }
+        return text
     }
 
     /// ~ раскрыт, путь абсолютный и нормализованный. Desktop, Documents и Downloads (и всё внутри)

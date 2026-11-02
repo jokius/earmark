@@ -53,13 +53,13 @@ public struct Transcriber: Sendable {
         }
         defer { lock.release() }
         let before = try claim(folder, force: force)
+        let language = self.language(of: before)
         do throws(EarmarkError) {
             let channels = try await transcribeChannels(
-                folder, force: force, progress: progress, shouldAbort: shouldAbort)
+                folder, force: force, language: language, progress: progress, shouldAbort: shouldAbort)
             if shouldAbort() { throw .interrupted }
             let transcript = Transcript(
-                recordingId: before.id, model: Models.largeV3Turbo.name,
-                language: config.transcriptionLanguage,
+                recordingId: before.id, model: Models.largeV3Turbo.name, language: language,
                 segments: TranscriptMerge.merge(mic: channels.mic, system: channels.system))
             try publish(transcript, in: folder)
             try update(folder) { meta in
@@ -116,18 +116,24 @@ public struct Transcriber: Sendable {
             meta.status = .transcribing
             meta.transcription.attempts += 1
             meta.transcription.fingerprint = Self.fingerprint
-            meta.transcription.language = config.transcriptionLanguage
+            meta.transcription.language = language(of: meta)
         }
         return meta
     }
 
-    /// Каналы по очереди: 0 — mic, 1 — system. Готовый канал с тем же fingerprint и языком не
+    /// Язык записи: свой у календаря, иначе глобальный (у ручной записи календаря нет).
+    private func language(of meta: RecordingMeta) -> String {
+        config.transcriptionLanguage(forCalendar: meta.calendar?.id)
+    }
+
+    /// Каналы по очереди: 0 — mic, 1 — system. Готовый канал с тем же fingerprint и языком записи не
     /// пересчитываем (воркер мог упасть на втором канале). Язык в fingerprint не входит (D4), поэтому
     /// сверяем его отдельно: иначе после смены языка в конфиге старый канал выдавался бы за новый язык.
     /// Модель грузим, только если хоть один канал нужно
     /// считать, и отпускаем вместе с этой функцией — до слияния.
     private func transcribeChannels(
-        _ folder: URL, force: Bool, progress: @escaping @Sendable (TranscribeProgress) -> Void,
+        _ folder: URL, force: Bool, language: String,
+        progress: @escaping @Sendable (TranscribeProgress) -> Void,
         shouldAbort: @escaping @Sendable () -> Bool
     ) async throws(EarmarkError) -> (mic: ChannelTranscript, system: ChannelTranscript) {
         var engine: (any SpeechEngine)?
@@ -136,7 +142,7 @@ public struct Transcriber: Sendable {
             let url = folder.appending(
                 path: channel == .mic ? RecordingFiles.transcriptMic : RecordingFiles.transcriptSystem)
             if !force, let existing = try? Self.decode(ChannelTranscript.self, at: url),
-                existing.fingerprint == Self.fingerprint, existing.language == config.transcriptionLanguage
+                existing.fingerprint == Self.fingerprint, existing.language == language
             {
                 done[channel] = existing
                 continue
@@ -156,11 +162,11 @@ public struct Transcriber: Sendable {
                 if shouldAbort() { throw .interrupted }
             }
             let raw = try await active.transcribe(
-                samples, params: .reference(language: config.transcriptionLanguage),
+                samples, params: .reference(language: language),
                 progress: { progress(TranscribeProgress(channel: channel, percent: $0)) },
                 shouldAbort: shouldAbort)
             let result = ChannelTranscript(
-                channel: channel, model: Models.largeV3Turbo.name, language: config.transcriptionLanguage,
+                channel: channel, model: Models.largeV3Turbo.name, language: language,
                 fingerprint: Self.fingerprint, segments: PostFilter.apply(raw))
             try Self.writeJSON(result, to: url)
             done[channel] = result

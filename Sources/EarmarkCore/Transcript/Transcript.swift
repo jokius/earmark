@@ -14,11 +14,14 @@ public struct RawSegment: Codable, Equatable, Sendable {
     public var startMs: Int
     public var endMs: Int
     public var text: String
+    /// Язык прогона при списке языков; nil у одного языка и auto — тогда поля нет в JSON.
+    public var language: String?
 
-    public init(startMs: Int, endMs: Int, text: String) {
+    public init(startMs: Int, endMs: Int, text: String, language: String? = nil) {
         self.startMs = startMs
         self.endMs = endMs
         self.text = text
+        self.language = language
     }
 }
 

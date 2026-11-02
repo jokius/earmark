@@ -71,8 +71,16 @@ public struct Config: Equatable, Sendable {
 
     public var keepRawTracks: Bool { bool("audio.keep_raw_tracks") }
     public var transcriptionEnabled: Bool { bool("transcription.enabled") }
-    /// "auto" или код whisper.
+    /// "auto", код whisper или список кодов через запятую (каноническая форма).
     public var transcriptionLanguage: String { string("transcription.language") }
+
+    /// calendar.<id>.language ?? transcriptionLanguage. Канонизируем и здесь: Config(values:)
+    /// собирают и в обход set.
+    public func transcriptionLanguage(forCalendar id: String?) -> String {
+        var language = transcriptionLanguage
+        if let id, case .string(let own)? = values["calendar.\(id).language"] { language = own }
+        return TranscriptionLanguage(language)?.raw ?? language
+    }
     public var labelMe: String { string("transcript.label_me") }
     public var labelThem: String { string("transcript.label_them") }
 

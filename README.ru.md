@@ -113,6 +113,11 @@ DEVELOPMENT_TEAM = <поле OU сертификата>
    earmark config set transcript.label_them "Собеседники"
    ```
 
+   Для созвонов на нескольких языках — список: `earmark config set transcription.language ru,en,az`.
+   Тогда каждый кусок речи расшифровывается на самом вероятном языке из списка, и английские
+   фразы остаются английскими, а не переводятся на русский. У календаря может быть свой список
+   (`calendar.<id>.language`) — его же можно задать под календарём в окне Settings.
+
 Записи ложатся в `~/Earmark`, папка создаётся с правами 0700. Поменять —
 `earmark config set recordings_dir <путь>`. Desktop, Documents и Downloads не принимаются: их
 охраняет macOS, и любой скрипт, читающий записи, упирался бы в запросы прав.
@@ -168,6 +173,7 @@ DEVELOPMENT_TEAM = <поле OU сертификата>
 | `calendars` | список id | `[]` | Включённые календари. Порядок — приоритет при одновременных событиях |
 | `calendar.<id>.lead_seconds` | int | — | Своё `lead_seconds` для календаря |
 | `calendar.<id>.folder` | строка | — | Имя папки вместо названия календаря |
+| `calendar.<id>.language` | строка | — | Свой `transcription.language` для календаря |
 | `stop.call_end_seconds` | int | `60` | Столько нет активности созвона → стоп (`call_ended`) |
 | `stop.after_end_seconds` | int | `120` | Событие кончилось столько назад, оба канала молчат → стоп (`event_over`) |
 | `stop.end_quiet_seconds` | int | `60` | Сколько оба канала должны молчать для `event_over` |
@@ -177,7 +183,7 @@ DEVELOPMENT_TEAM = <поле OU сертификата>
 | `stop.min_keep_seconds` | int | `45` | Авто-записи короче удаляются |
 | `audio.keep_raw_tracks` | bool | `false` | Не удалять `mic.caf` и `system.caf` после сведения |
 | `transcription.enabled` | bool | `true` | Расшифровывать после каждой записи |
-| `transcription.language` | строка | `auto` | Код языка Whisper (`en`, `ru`, …) или `auto` |
+| `transcription.language` | строка | `auto` | `auto`, код языка Whisper (`ru`) или список через запятую (`ru,en,az`) — язык выбирается для каждого куска речи |
 | `transcript.label_me` | строка | `Me` | Моя подпись в `transcript.txt` |
 | `transcript.label_them` | строка | `Them` | Подпись собеседников в `transcript.txt` |
 

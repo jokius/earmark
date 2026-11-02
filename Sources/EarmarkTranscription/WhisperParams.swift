@@ -5,7 +5,8 @@ import whisper
 /// совпадении этих значений, поэтому они собраны в одном месте, а `version` входит в fingerprint:
 /// поменял что-то здесь — подними версию, и готовые transcript.<ch>.json пересчитаются.
 public struct WhisperParams: Equatable, Sendable {
-    /// Код языка whisper или "auto": тогда whisper сам определяет язык на весь канал.
+    /// Код языка whisper или "auto" (whisper сам определяет язык на весь канал), или список кодов
+    /// через запятую — тогда WhisperEngine выбирает язык из списка по кускам речи.
     public var language: String
     public var threads: Int32
 

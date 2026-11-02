@@ -26,6 +26,8 @@ struct ConfigTests {
         #expect(!config.keepRawTracks)
         #expect(config.transcriptionEnabled)
         #expect(config.transcriptionLanguage == "auto")
+        #expect(config.transcriptionLanguage(forCalendar: "CAL-1") == "auto")
+        #expect(config.transcriptionLanguage(forCalendar: nil) == "auto")
         #expect(config.labelMe == "Me")
         #expect(config.labelThem == "Them")
     }
@@ -57,6 +59,12 @@ struct ConfigTests {
         #expect(throws: ConfigError.self) { try config.set("lead_seconds", value: .string("30")) }
         #expect(throws: ConfigError.self) { try config.set("auto_record", value: .int(1)) }
         #expect(throws: ConfigError.self) { try config.set("calendar.CAL-1.folder", value: .string("../x")) }
+        #expect(throws: ConfigError.self) {
+            try config.set("calendar.CAL-1.language", value: .string("english"))
+        }
+        #expect(throws: ConfigError.self) {
+            try config.set("transcription.language", value: .string("auto,ru"))
+        }
         #expect(throws: ConfigError.unknownKey("nope")) { try config.set("nope", value: .bool(true)) }
         #expect(config == Config())
     }
@@ -68,6 +76,51 @@ struct ConfigTests {
         #expect(config.stop.endQuietSeconds == 90)
         #expect(throws: ConfigError.unknownKey("stop.far_end_quiet_seconds")) {
             try config.set("stop.far_end_quiet_seconds", raw: "90")
+        }
+    }
+
+    @Test("язык записи: calendar.<id>.language, если задан, иначе transcription.language; канонический")
+    func languageForCalendar() throws {
+        var config = Config()
+        let global = try config.set("transcription.language", raw: " RU ")
+        #expect(global.new == .string("ru"))
+
+        let override = try config.set("calendar.CAL-1.language", raw: " RU , en,az,en")
+        #expect(override.old == nil)
+        #expect(override.new == .string("ru,en,az"))
+        #expect(config.values["calendar.CAL-1.language"] == .string("ru,en,az"))
+
+        #expect(config.transcriptionLanguage(forCalendar: "CAL-1") == "ru,en,az")
+        #expect(config.transcriptionLanguage(forCalendar: "CAL-2") == "ru")
+        #expect(config.transcriptionLanguage(forCalendar: nil) == "ru")
+        #expect(config.transcriptionLanguage == "ru")
+
+        let second = try config.set("calendar.CAL-1.language", raw: "en")
+        #expect(second.old == .string("ru,en,az"))
+        #expect(config.transcriptionLanguage(forCalendar: "CAL-1") == "en")
+
+        try config.reset("calendar.CAL-1.language")
+        #expect(config.values["calendar.CAL-1.language"] == nil)
+        #expect(config.transcriptionLanguage(forCalendar: "CAL-1") == "ru")
+    }
+
+    @Test("невалидный язык календаря не сохраняется: invalidValue, конфиг прежний")
+    func invalidCalendarLanguage() throws {
+        var config = Config()
+        try config.set("calendar.CAL-1.language", raw: "ru,en")
+        let before = config
+
+        let error = #expect(throws: ConfigError.self) {
+            try config.set("calendar.CAL-1.language", raw: "ru,aze")
+        }
+        guard case .invalidValue(let key, _)? = error else {
+            Issue.record("ожидали invalidValue, получили \(String(describing: error))")
+            return
+        }
+        #expect(key == "calendar.CAL-1.language")
+        #expect(config == before)
+        #expect(throws: ConfigError.unknownKey("calendar..language")) {
+            try config.set("calendar..language", raw: "ru")
         }
     }
 
@@ -113,6 +166,28 @@ struct ConfigTests {
         #expect(auto.isDefault)
         #expect(items.first { $0.key == "calendar.*.folder" }?.value == .null)
         #expect(items.first { $0.key == "calendar.CAL-1.folder" }?.value == "One")
+    }
+
+    @Test("listing: шаблон calendar.*.language со значением null и типом string, заданные ключи сразу за ним")
+    func listingLanguage() throws {
+        var config = Config()
+        try config.set("calendar.CAL-2.language", raw: "en")
+        try config.set("calendar.CAL-1.language", raw: "RU,en")
+
+        let items = config.listing()
+        let keys = items.map(\.key)
+
+        #expect(items.count == ConfigSchema.all.count + 2)
+        let template = try #require(keys.firstIndex(of: "calendar.*.language"))
+        #expect(
+            Array(keys[template...].prefix(3)) == [
+                "calendar.*.language", "calendar.CAL-1.language", "calendar.CAL-2.language",
+            ])
+        let templateItem = items[template]
+        #expect(templateItem.value == .null)
+        #expect(templateItem.type == .string)
+        #expect(items.first { $0.key == "calendar.CAL-1.language" }?.value == "ru,en")
+        #expect(items.first { $0.key == "transcription.language" }?.value == "auto")
     }
 }
 
@@ -165,10 +240,26 @@ struct ConfigStoreTests {
         "ручная правка с неизвестным ключом или кривым значением — ошибка загрузки",
         arguments: [
             #"{"lead_seconds": "soon"}"#, #"{"lead_seconds": 99999}"#, #"{"colour": "red"}"#, "{not json",
+            #"{"transcription.language": "auto,ru"}"#, #"{"transcription.language": "ru,xx"}"#,
+            #"{"calendar.CAL-1.language": "english"}"#, #"{"calendar.CAL-1.language": ""}"#,
+            #"{"calendar..language": "ru"}"#,
         ])
     func invalidFile(text: String) throws {
         let url = try makeTempDir().appendingPathComponent("config.json")
         try Data(text.utf8).write(to: url)
         #expect(throws: (any Error).self) { try ConfigStore(url: url).load() }
+    }
+
+    @Test("config.json со списками языков загружается, язык записи — каноническая строка")
+    func languagesFromFile() throws {
+        let url = try makeTempDir().appendingPathComponent("config.json")
+        let text = #"{"transcription.language": "ru,en", "calendar.CAL-1.language": " RU , en,az"}"#
+        try Data(text.utf8).write(to: url)
+
+        let config = try ConfigStore(url: url).load()
+
+        #expect(config.transcriptionLanguage(forCalendar: "CAL-1") == "ru,en,az")
+        #expect(config.transcriptionLanguage(forCalendar: "CAL-2") == "ru,en")
+        #expect(config.transcriptionLanguage(forCalendar: nil) == "ru,en")
     }
 }

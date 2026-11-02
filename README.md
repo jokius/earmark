@@ -114,6 +114,11 @@ certificate's `OU` field, not from the parentheses in its name — those are dif
    earmark config set transcript.label_them "Собеседники"
    ```
 
+   Calls in several languages take a list: `earmark config set transcription.language ru,en,az`.
+   Each speech fragment is then transcribed in the most likely language of the list, so English
+   phrases stay English instead of being translated into Russian. A calendar can have its own
+   list (`calendar.<id>.language`), also editable under the calendar in Settings.
+
 Recordings go to `~/Earmark`, created with mode 0700. Change it with
 `earmark config set recordings_dir <path>`. Desktop, Documents and Downloads are refused: macOS
 guards them, and every script that reads your recordings would hit permission prompts.
@@ -169,6 +174,7 @@ while the app is running take effect only after a restart.
 | `calendars` | list of ids | `[]` | Enabled calendars. The order is the priority when events overlap |
 | `calendar.<id>.lead_seconds` | int | — | Per-calendar override of `lead_seconds` |
 | `calendar.<id>.folder` | string | — | Folder name instead of the calendar title |
+| `calendar.<id>.language` | string | — | Per-calendar override of `transcription.language` |
 | `stop.call_end_seconds` | int | `60` | No call activity this long → stop (`call_ended`) |
 | `stop.after_end_seconds` | int | `120` | Event ended this long ago and both channels are quiet → stop (`event_over`) |
 | `stop.end_quiet_seconds` | int | `60` | How long both channels must stay quiet for `event_over` |
@@ -178,7 +184,7 @@ while the app is running take effect only after a restart.
 | `stop.min_keep_seconds` | int | `45` | Shorter auto-recordings are deleted |
 | `audio.keep_raw_tracks` | bool | `false` | Keep `mic.caf` and `system.caf` after muxing |
 | `transcription.enabled` | bool | `true` | Transcribe after each recording |
-| `transcription.language` | string | `auto` | Whisper language code (`en`, `ru`, …) or `auto` |
+| `transcription.language` | string | `auto` | `auto`, a Whisper language code (`ru`) or a comma-separated list (`ru,en,az`) picked per speech fragment |
 | `transcript.label_me` | string | `Me` | My label in `transcript.txt` |
 | `transcript.label_them` | string | `Them` | Their label in `transcript.txt` |
 

@@ -7,20 +7,23 @@ import Testing
 @testable import EarmarkTranscription
 
 /// Движок-фейк: отдаёт заготовленные ответы по порядку вызовов (сначала mic, потом system)
-/// и запоминает, сколько сэмплов получил.
+/// и запоминает, сколько сэмплов и какой язык получил.
 private final class FakeEngine: SpeechEngine {
     private let replies: Mutex<[Result<[RawSegment], EarmarkError>]>
     private let seen = Mutex<[Int]>([])
+    private let seenLanguages = Mutex<[String]>([])
 
     init(_ replies: [Result<[RawSegment], EarmarkError>]) { self.replies = Mutex(replies) }
 
     var sampleCounts: [Int] { seen.withLock { $0 } }
+    var languages: [String] { seenLanguages.withLock { $0 } }
 
     func transcribe(
         _ samples: [Float], params: WhisperParams, progress: @escaping @Sendable (Int) -> Void,
         shouldAbort: @escaping @Sendable () -> Bool
     ) async throws(EarmarkError) -> [RawSegment] {
         seen.withLock { $0.append(samples.count) }
+        seenLanguages.withLock { $0.append(params.language) }
         progress(100)
         let reply = replies.withLock { $0.isEmpty ? .success([]) : $0.removeFirst() }
         return try reply.get()
@@ -40,8 +43,9 @@ private struct RecordingFixture {
     let folder: URL
     var store: RecordingStore { RecordingStore(root: root) }
 
+    /// calendarId: запись по событию этого календаря (meta.calendar); nil — ручная запись.
     init(
-        status: String = "recorded", attempts: Int = 0, seconds: Double = 2,
+        status: String = "recorded", attempts: Int = 0, seconds: Double = 2, calendarId: String? = nil,
         left: (Int) -> Float = { _ in 0 }, right: (Int) -> Float = { _ in 0 }
     )
         throws
@@ -49,9 +53,16 @@ private struct RecordingFixture {
         root = FileManager.default.temporaryDirectory.appending(path: "earmark-tr-\(UUID().uuidString)")
         folder = root.appending(path: "Manual/2026-10-02 14-00 Test")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        // Календарная запись в meta — как в примере спеки §7.2: trigger, calendar и event.
+        let trigger =
+            calendarId.map {
+                #""trigger":"calendar","calendar":{"id":"\#($0)","title":"Calls"},"#
+                    + #""event":{"id":"evt-1","external_id":"ext-1","start":"2026-10-02T10:00:00Z","#
+                    + #""end":"2026-10-02T10:30:00Z"},"#
+            } ?? #""trigger":"manual","#
         // meta пишем JSON-литералом: так фикстура не зависит от инициализаторов RecordingMeta.
         let meta = """
-            {"schema_version":1,"id":"20261002-1400-a1b2","status":"\(status)","trigger":"manual",\
+            {"schema_version":1,"id":"20261002-1400-a1b2","status":"\(status)",\(trigger)\
             "title":"Test","started_at":"2026-10-02T10:00:00Z","duration_sec":\(seconds),"call_apps":[],\
             "recovered":false,"transcription":{"attempts":\(attempts)},"app_version":"0.1.0"}
             """
@@ -101,10 +112,15 @@ struct TranscriberTests {
         "transcript.label_them": .string("Собеседники"),
     ])
 
-    private func transcriber(_ fixture: RecordingFixture, _ engine: FakeEngine, calls: Counter = Counter())
-        -> Transcriber
-    {
-        Transcriber(store: fixture.store, config: config) {
+    /// Глобально ru, у календаря CAL-LANGS свой список, у CAL-PLAIN своего языка нет.
+    private static let calendarConfig = Config(values: [
+        "transcription.language": .string("ru"), "calendar.CAL-LANGS.language": .string("ru,en,az"),
+    ])
+
+    private func transcriber(
+        _ fixture: RecordingFixture, _ engine: FakeEngine, calls: Counter = Counter(), config: Config? = nil
+    ) -> Transcriber {
+        Transcriber(store: fixture.store, config: config ?? self.config) {
             () async throws(EarmarkError) -> any SpeechEngine in
             calls.increment()
             return engine
@@ -373,5 +389,114 @@ struct TranscriberTests {
         let meta = try fixture.meta
         #expect(meta.transcription.attempts == 0)
         #expect(meta.status == .recorded)
+    }
+
+    /// Язык из каждого места, куда Transcriber его пишет: движок, оба канала, transcript.json, meta.
+    private struct WrittenLanguages: Equatable {
+        var engine: [String]
+        var mic: String
+        var system: String
+        var transcript: String
+        var meta: String?
+    }
+
+    private func writtenLanguages(_ fixture: RecordingFixture, _ engine: FakeEngine) throws
+        -> WrittenLanguages
+    {
+        let decoder = EarmarkJSON.decoder
+        return WrittenLanguages(
+            engine: engine.languages,
+            mic: try decoder.decode(
+                ChannelTranscript.self, from: Data(contentsOf: fixture.file(RecordingFiles.transcriptMic))
+            ).language,
+            system: try decoder.decode(
+                ChannelTranscript.self, from: Data(contentsOf: fixture.file(RecordingFiles.transcriptSystem))
+            ).language,
+            transcript: try decoder.decode(
+                Transcript.self, from: Data(contentsOf: fixture.file(RecordingFiles.transcript))
+            ).language,
+            meta: try fixture.meta.transcription.language)
+    }
+
+    @Test(
+        "язык записи берётся по её календарю: свой список календаря, иначе глобальный",
+        arguments: [
+            ("CAL-LANGS", "ru,en,az"),
+            ("CAL-PLAIN", "ru"),
+            (nil, "ru"),
+        ] as [(String?, String)])
+    func languagePerCalendar(calendarId: String?, expected: String) async throws {
+        let fixture = try RecordingFixture(calendarId: calendarId)
+        let engine = FakeEngine([.success([]), .success([])])
+
+        let transcript = try await run(transcriber(fixture, engine, config: Self.calendarConfig), fixture)
+
+        #expect(transcript.language == expected)
+        #expect(
+            try writtenLanguages(fixture, engine)
+                == WrittenLanguages(
+                    engine: [expected, expected], mic: expected, system: expected, transcript: expected,
+                    meta: expected))
+    }
+
+    @Test("готовый канал на глобальном языке у календаря со своим списком пересчитывается")
+    func readyChannelRecomputedForCalendarLanguage() async throws {
+        let fixture = try RecordingFixture(calendarId: "CAL-LANGS")
+        let ready = ChannelTranscript(
+            channel: .mic, model: "ggml-large-v3-turbo", language: "ru", fingerprint: Transcriber.fingerprint,
+            segments: [RawSegment(startMs: 0, endMs: 500, text: "старое")])
+        try EarmarkJSON.encoder.encode(ready).write(to: fixture.file(RecordingFiles.transcriptMic))
+        let engine = FakeEngine([
+            .success([RawSegment(startMs: 0, endMs: 500, text: "новое")]), .success([]),
+        ])
+
+        let transcript = try await run(transcriber(fixture, engine, config: Self.calendarConfig), fixture)
+
+        #expect(transcript.segments.map(\.text) == ["новое"])
+        #expect(engine.languages == ["ru,en,az", "ru,en,az"])
+        #expect(try writtenLanguages(fixture, engine).mic == "ru,en,az")
+    }
+
+    @Test("готовый канал на языке календаря переиспользуется, хотя глобальный язык другой")
+    func readyChannelKeptForCalendarLanguage() async throws {
+        let fixture = try RecordingFixture(calendarId: "CAL-LANGS")
+        let ready = ChannelTranscript(
+            channel: .mic, model: "ggml-large-v3-turbo", language: "ru,en,az",
+            fingerprint: Transcriber.fingerprint,
+            segments: [RawSegment(startMs: 0, endMs: 500, text: "уже было")])
+        try EarmarkJSON.encoder.encode(ready).write(to: fixture.file(RecordingFiles.transcriptMic))
+        let engine = FakeEngine([.success([RawSegment(startMs: 100, endMs: 600, text: "собеседник")])])
+
+        let transcript = try await run(transcriber(fixture, engine, config: Self.calendarConfig), fixture)
+
+        #expect(transcript.segments.map(\.text) == ["уже было", "собеседник"])
+        #expect(engine.languages == ["ru,en,az"])
+        #expect(try fixture.meta.transcription.language == "ru,en,az")
+    }
+
+    @Test("язык сегмента от движка попадает в transcript.<ch>.json, а у сегментов без языка поля нет")
+    func segmentLanguageInChannelFile() async throws {
+        let fixture = try RecordingFixture(calendarId: "CAL-LANGS")
+        let engine = FakeEngine([
+            .success([
+                RawSegment(startMs: 0, endMs: 900, text: "привет", language: "ru"),
+                RawSegment(startMs: 2_000, endMs: 2_900, text: "  hello there ", language: "en"),
+            ]),
+            .success([RawSegment(startMs: 500, endMs: 1_500, text: "здравствуйте")]),
+        ])
+
+        let transcript = try await run(transcriber(fixture, engine, config: Self.calendarConfig), fixture)
+
+        #expect(transcript.segments.map(\.text) == ["привет", "здравствуйте", "hello there"])
+        let mic = try EarmarkJSON.decoder.decode(
+            ChannelTranscript.self, from: Data(contentsOf: fixture.file(RecordingFiles.transcriptMic)))
+        #expect(mic.segments.map(\.language) == ["ru", "en"])
+        #expect(mic.segments.map(\.text) == ["привет", "hello there"])
+        let system = try #require(
+            try JSONSerialization.jsonObject(
+                with: Data(contentsOf: fixture.file(RecordingFiles.transcriptSystem))) as? [String: Any])
+        let segments = try #require(system["segments"] as? [[String: Any]])
+        #expect(segments.count == 1)
+        #expect(segments.allSatisfy { $0["language"] == nil })
     }
 }

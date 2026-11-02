@@ -11,8 +11,8 @@ audio) go to separate channels. It starts on its own a minute before an event fr
 calendars you pick, stops when the call app lets go of the microphone, files the recording into
 that calendar's folder and transcribes it locally with whisper.cpp into a "Me / Them" dialogue.
 Like [Anarlog](https://github.com/fastrepl/anarlog), without the frills: no AI summaries, no
-cloud, no settings window — everything is driven by the `earmark` command line, by you or by
-your coding agent.
+cloud. A small Settings window picks calendars and languages; everything else is driven by the
+`earmark` command line, by you or by your coding agent.
 
 ## Features
 
@@ -35,7 +35,8 @@ your coding agent.
 ## What it deliberately does not do
 
 - No AI summaries or notes, no meeting reminders, no cloud and no sync.
-- No settings window and no transcript editor: the menu bar icon and the CLI are all there is.
+- No transcript editor, and Settings covers only calendars and languages: the rest is the menu bar
+  icon and the CLI.
 - No post-recording hooks: wait for `audio.m4a` or `transcript.json` to appear, or poll
   `earmark recordings --status transcribed`.
 - No speaker diarization yet: everyone on the far end is "Them".
@@ -117,7 +118,8 @@ certificate's `OU` field, not from the parentheses in its name — those are dif
    Calls in several languages take a list: `earmark config set transcription.language ru,en,az`.
    Each speech fragment is then transcribed in the most likely language of the list, so English
    phrases stay English instead of being translated into Russian. A calendar can have its own
-   list (`calendar.<id>.language`), also editable under the calendar in Settings.
+   list (`calendar.<id>.language`). Both the default list and a calendar's own are editable in
+   Settings.
 
 Recordings go to `~/Earmark`, created with mode 0700. Change it with
 `earmark config set recordings_dir <path>`. Desktop, Documents and Downloads are refused: macOS

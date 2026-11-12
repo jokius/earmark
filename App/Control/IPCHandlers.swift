@@ -9,6 +9,7 @@ import os
 /// | recording.start | `title?` | CurrentRecordingInfo |
 /// | recording.stop | — | RecordingMeta или null (discard) |
 /// | recording.move | `id`, `calendar_id` (строка; null или нет — Manual) | `{id, path, calendar}` |
+/// | recording.merge | `id` (цель — запись, закончившаяся прямо перед ней) | `{id, merged, path}` |
 /// | calendar.list | — | [CalendarListItem] |
 /// | calendar.upcoming | `hours?` (1…168, по умолчанию 24) | [UpcomingItem] |
 /// | config.set | `key`, `value` (строка, как из CLI) | `{key, old, new}` |
@@ -23,11 +24,11 @@ import os
 enum IPCHandlers {
     private static let logger = Logger(subsystem: EarmarkPaths.bundleID, category: "ipc")
     private static let journaled: Set<String> = [
-        IPCMethod.recordingStart, IPCMethod.recordingStop, IPCMethod.recordingMove,
+        IPCMethod.recordingStart, IPCMethod.recordingStop, IPCMethod.recordingMove, IPCMethod.recordingMerge,
     ]
 
     static func handle(_ request: IPCRequest, peer: pid_t, model: AppModel) async -> IPCResponse {
-        // Старт, стоп и перенос записи из CLI или агента — действия с последствиями для приватности:
+        // Старт, стоп, перенос и склейка записи из CLI или агента — действия с последствиями для приватности:
         // кто попросил, остаётся в журнале (§9.2).
         if journaled.contains(request.method) {
             logger.notice("\(request.method, privacy: .public) from pid \(peer, privacy: .public)")
@@ -53,6 +54,8 @@ enum IPCHandlers {
             return try encode(try await model.stopRecording())
         case IPCMethod.recordingMove:
             return try model.moveRecording(id: try string(params, "id"), calendarID: try calendarID(params))
+        case IPCMethod.recordingMerge:
+            return try await model.mergeRecording(id: try string(params, "id"))
         case IPCMethod.calendarList:
             return try encode(model.calendarsList())
         case IPCMethod.calendarUpcoming:

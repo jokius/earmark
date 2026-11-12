@@ -61,13 +61,17 @@ struct RecordingMoveTests {
 
         /// Поля meta без calendar: всё, что move обязан оставить как было.
         func fieldsExceptCalendar(_ dir: URL) throws -> [String: JSONValue] {
+            try fields(dir, except: ["calendar"])
+        }
+
+        /// Поля meta без перечисленных ключей.
+        func fields(_ dir: URL, except keys: Set<String>) throws -> [String: JSONValue] {
             let meta = try #require(try store.readMeta(in: dir))
             guard
-                case .object(var fields) = try JSONDecoder().decode(
+                case .object(let fields) = try JSONDecoder().decode(
                     JSONValue.self, from: EarmarkJSON.encoder.encode(meta))
             else { return [:] }
-            fields["calendar"] = nil
-            return fields
+            return fields.filter { !keys.contains($0.key) }
         }
 
         /// Освобождённый lock может мгновение числиться занятым (см. FileLockTests.acquireSoon).
@@ -248,24 +252,113 @@ struct RecordingMoveTests {
     }
 
     @Test(
-        "не ручная или внутри события — invalid_arguments, запись на месте",
+        "запись по календарю (с событием или без) — invalid_arguments, запись на месте",
         arguments: [
             ["trigger": "calendar", "calendar": workJSON],
-            ["event": eventJSON],
+            ["trigger": "calendar", "calendar": workJSON, "event": eventJSON],
         ] as [[String: JSONValue]])
-    func onlyManualOutsideEvents(overrides: [String: JSONValue]) throws {
+    func onlyManual(overrides: [String: JSONValue]) throws {
         let fixture = try Fixture()
         let store = fixture.store
-        let source = try fixture.recording("Manual/\(Self.leaf)", overrides)
+        let source = try fixture.recording("Work/\(Self.leaf)", overrides)
         let metaBefore = try Data(contentsOf: source.appendingPathComponent(RecordingFiles.meta))
 
         let error = #expect(throws: EarmarkError.self) {
             try store.move(id: "m1", to: CalendarRef(id: "cal-team", title: "Team"), folder: "Team")
         }
         #expect(error?.code == "invalid_arguments")
-        #expect(error?.message.contains("only manual recordings outside a calendar event") == true)
+        #expect(
+            error?.message.contains("only manual recordings can be moved") == true, "\(error?.message ?? "")")
         #expect(try Data(contentsOf: source.appendingPathComponent(RecordingFiles.meta)) == metaBefore)
         #expect(!FileManager.default.fileExists(atPath: fixture.url("Team").path))
+    }
+
+    /// Имя папки ручной записи, потерявшей событие: startedAt в локальной зоне, как createRecordingFolder.
+    private static func manualLeaf() throws -> String {
+        let started = try #require(ISO8601DateFormatter().date(from: "2026-10-02T11:00:00Z"))
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyy-MM-dd HH-mm"
+        return formatter.string(from: started) + " Manual recording"
+    }
+
+    /// Ручная запись, которую при старте угадали по событию: календарь, событие и его название.
+    private static let eventLeaf = "2026-10-02 14-00 Daily sync"
+    private static let withEvent: [String: JSONValue] = [
+        "calendar": workJSON, "event": eventJSON, "title": "Daily sync",
+    ]
+
+    @Test(
+        "ручная с событием в другой календарь или в Manual: событие снято, title и имя папки — Manual recording",
+        arguments: ["Team", nil] as [String?])
+    func eventIsDroppedOnMove(folder: String?) throws {
+        let fixture = try Fixture()
+        let store = fixture.store
+        let source = try fixture.recording("Work/\(Self.eventLeaf)", Self.withEvent)
+        let filesBefore = try fixture.files(source)
+        let fieldsBefore = try fixture.fields(source, except: ["calendar", "event", "title"])
+        let calendar = folder.map { CalendarRef(id: "cal-team", title: $0) }
+        let target = fixture.url("\(folder ?? "Manual")/\(try Self.manualLeaf())")
+
+        let moved = try store.move(id: "m1", to: calendar, folder: folder)
+
+        #expect(moved.id == "m1")
+        #expect(path(moved.url) == path(target))
+        #expect(!FileManager.default.fileExists(atPath: source.path))
+        let meta = try #require(try store.readMeta(in: target))
+        #expect(meta.calendar == calendar)
+        #expect(meta.event == nil)
+        #expect(meta.title == "Manual recording")
+        #expect(try fixture.fields(target, except: ["calendar", "event", "title"]) == fieldsBefore)
+        // транскрипты и аудио не трогаются
+        #expect(try fixture.files(target) == filesBefore)
+        #expect(try store.find(id: "m1").map { path($0.url) } == path(target))
+        #expect(try store.list(.init(calendarId: "cal-work")).isEmpty)
+    }
+
+    @Test("ручная с событием: новое имя занято в назначении — « (2)», чужая папка не тронута")
+    func eventDropCollisionGetsSuffix() throws {
+        let fixture = try Fixture()
+        let store = fixture.store
+        let taken = try Self.manualLeaf()
+        let other = try fixture.recording(
+            "Team/\(taken)", ["id": "other", "calendar": ["id": "cal-team", "title": "Team"]])
+        let otherFiles = try fixture.files(other)
+        let otherMeta = try Data(contentsOf: other.appendingPathComponent(RecordingFiles.meta))
+        try fixture.recording("Work/\(Self.eventLeaf)", Self.withEvent)
+
+        let moved = try store.move(id: "m1", to: CalendarRef(id: "cal-team", title: "Team"), folder: "Team")
+
+        #expect(path(moved.url) == path(fixture.url("Team/\(taken) (2)")))
+        #expect(try store.readMeta(in: moved.url)?.title == "Manual recording")
+        #expect(try fixture.files(other) == otherFiles)
+        #expect(try Data(contentsOf: other.appendingPathComponent(RecordingFiles.meta)) == otherMeta)
+    }
+
+    @Test(
+        "ручная с событием туда же, где лежит (тот же календарь; Manual — без календаря), — ничего не пишется",
+        arguments: ["Work", nil] as [String?])
+    func sameCalendarWithEventIsNoOp(folder: String?) throws {
+        let fixture = try Fixture()
+        let store = fixture.store
+        let overrides: [String: JSONValue] =
+            folder == nil ? ["event": Self.eventJSON, "title": "Daily sync"] : Self.withEvent
+        let source = try fixture.recording("\(folder ?? "Manual")/\(Self.eventLeaf)", overrides)
+        let metaURL = source.appendingPathComponent(RecordingFiles.meta)
+        let past = Date(timeIntervalSince1970: 1_700_000_000)
+        try FileManager.default.setAttributes([.modificationDate: past], ofItemAtPath: metaURL.path)
+        let bytes = try Data(contentsOf: metaURL)
+
+        let moved = try store.move(id: "m1", to: folder.map { _ in fixture.work }, folder: folder)
+
+        #expect(path(moved.url) == path(source))
+        #expect(try Data(contentsOf: metaURL) == bytes)
+        let modified =
+            try FileManager.default.attributesOfItem(atPath: metaURL.path)[.modificationDate] as? Date
+        #expect(modified == past)
+        #expect(try store.readMeta(in: source)?.event != nil)
+        #expect(try store.readMeta(in: source)?.title == "Daily sync")
     }
 
     @Test("идёт расшифровка (.transcribe.lock занят) — busy, ничего не двигается")
@@ -304,15 +397,23 @@ struct RecordingMoveTests {
     }
 
     @Test(
-        "needsProject: ручная, без календаря и события, не после восстановления",
+        "needsProject: любая ручная, кроме остановленной восстановлением (stop_reason recovered)",
         arguments: [
             ([:], true),
             (["stop_reason": .null], true),
             (["stop_reason": "call_ended"], true),
+            (["calendar": workJSON], true),
+            (["event": eventJSON], true),
+            (["calendar": workJSON, "event": eventJSON], true),
+            // правило смотрит на stop_reason, а не на флаг recovered (после склейки они расходятся)
+            (["recovered": true], true),
             (["trigger": "calendar"], false),
-            (["calendar": workJSON], false),
-            (["event": eventJSON], false),
+            (["trigger": "calendar", "calendar": workJSON, "event": eventJSON], false),
             (["stop_reason": "recovered", "recovered": true], false),
+            (
+                ["calendar": workJSON, "event": eventJSON, "stop_reason": "recovered", "recovered": true],
+                false
+            ),
         ] as [([String: JSONValue], Bool)])
     func needsProject(overrides: [String: JSONValue], expected: Bool) throws {
         let json = JSONValue.object(Self.baseMeta.merging(overrides) { $1 })

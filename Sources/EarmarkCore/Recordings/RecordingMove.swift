@@ -1,11 +1,12 @@
 import Foundation
 
 extension RecordingMeta {
-    /// Ручная запись вне событий календаря, остановленная не восстановлением: app спрашивает проект.
-    /// Восстановленную после сбоя не спрашиваем: со звонка давно ушли, и вопрос из ниоткуда
+    /// Ручная запись, остановленная не восстановлением: app спрашивает проект. Календарь и событие
+    /// не в счёт: ручная запись посреди встречи угадывает её календарь по времени, а звонок мог быть
+    /// другим. Восстановленную после сбоя не спрашиваем: со звонка давно ушли, и вопрос из ниоткуда
     /// при старте app только сбил бы с толку.
     public var needsProject: Bool {
-        trigger == .manual && calendar == nil && event == nil && stopReason != .recovered
+        trigger == .manual && stopReason != .recovered
     }
 }
 
@@ -13,6 +14,9 @@ extension RecordingStore {
     /// Кладёт законченную ручную запись под календарь или обратно в Manual.
     /// calendar и folder либо оба nil (Manual), либо оба заданы (folder — имя папки календаря,
     /// как его считает calendarFolderName). Возвращает папку на новом месте с новой meta.
+    ///
+    /// Запись уводится от своего события: event = nil, название и имя папки — как у ручной записи
+    /// без события. Название встречи в чужом проекте — та же путаница, что и чужой календарь.
     ///
     /// Всё — под .transcribe.lock: воркер, стартующий одновременно, получит busy, а не папку,
     /// уехавшую посреди расшифровки. Транскрипты не переделываются — это `transcribe --force`.
@@ -23,43 +27,64 @@ extension RecordingStore {
             throw .invalidArguments("calendar and folder go together: pass both or neither")
         }
         let (found, stale) = try movable(id)
-        let parent = root.appendingPathComponent(
-            Self.sanitize(folder ?? RecordingFiles.manualFolder), isDirectory: true)
-        // Без учёта регистра, как APFS: «work» и «Work» — одна папка, переезжать некуда.
-        let sameParent =
-            found.url.deletingLastPathComponent().lastPathComponent
-            .compare(parent.lastPathComponent, options: .caseInsensitive) == .orderedSame
-        // Идемпотентно и до lock'а: повтор того же ответа не создаёт даже файла lock'а.
-        if sameParent && stale.calendar == calendar { return found }
-
-        let lock: FileLock?
-        do {
-            lock = try FileLock.tryAcquire(
-                at: found.url.appendingPathComponent(RecordingFiles.transcribeLock))
-        } catch {
-            throw .operationFailed("\(RecordingFiles.transcribeLock): \(error.localizedDescription)")
-        }
-        guard let lock else {
-            throw .busy("recording \(id) is being transcribed; move it when transcription finishes")
-        }
+        // Туда, где запись уже числится, — ничего не пишем, даже файла lock'а: повтор ответа и
+        // выделенная кнопка вопроса. Событие и название остаются.
+        if stale.calendar?.id == calendar?.id { return found }
+        let lock = try Self.lockRecording(found.url, id: id, for: "move")
         defer { lock.release() }
         // Снимок find мог устареть, пока брали lock: воркер, которого app не ведёт (ручной
         // `earmark transcribe <id> --now`), успел дописать status и transcription. Записав снимок
         // обратно, move стёр бы расшифровку. Поэтому проверки, новая meta и откат — по meta,
         // прочитанной уже под lock'ом.
-        let current: RecordingFolder
+        let current = try reload(found, id: id)
+        let meta = try Self.movableMeta(current, id: id)
+        if meta.calendar?.id == calendar?.id { return current }
+        var moved = meta
+        moved.calendar = calendar
+        var name: String?
+        if meta.event != nil {
+            moved.event = nil
+            moved.title = RecordingFiles.manualTitle
+            name = Self.folderBaseName(title: moved.title, startedAt: meta.startedAt)
+        }
+        let here = found.url.deletingLastPathComponent()
+        let parent = root.appendingPathComponent(
+            Self.sanitize(folder ?? RecordingFiles.manualFolder), isDirectory: true)
+        // Без учёта регистра, как APFS: «work» и «Work» — одна папка, переезжать некуда.
+        let sameParent =
+            here.lastPathComponent.compare(parent.lastPathComponent, options: .caseInsensitive)
+            == .orderedSame
+        // Тот же родитель и прежнее имя — папка остаётся, меняется только meta.
+        let into: URL? = sameParent ? (name == nil ? nil : here) : parent
+        let url = try relocate(found.url, from: meta, to: moved, into: into, name: name)
+        return RecordingFolder(url: url, meta: moved, manifest: nil)
+    }
+
+    /// .transcribe.lock записи на время правки её папки (move, склейка). Занят — busy: идёт расшифровка.
+    public static func lockRecording(_ dir: URL, id: String, for action: String) throws(EarmarkError)
+        -> FileLock
+    {
+        let lock: FileLock?
         do {
-            current = RecordingFolder(
-                url: found.url, meta: try readMeta(in: found.url), manifest: try readManifest(in: found.url))
+            lock = try FileLock.tryAcquire(at: dir.appendingPathComponent(RecordingFiles.transcribeLock))
+        } catch {
+            throw .operationFailed("\(RecordingFiles.transcribeLock): \(error.localizedDescription)")
+        }
+        guard let lock else {
+            throw .busy("recording \(id) is being transcribed; \(action) it when transcription finishes")
+        }
+        return lock
+    }
+
+    /// Папка, перечитанная с диска, — под lock'ом, взамен снимка find.
+    public func reload(_ folder: RecordingFolder, id: String) throws(EarmarkError) -> RecordingFolder {
+        do {
+            return RecordingFolder(
+                url: folder.url, meta: try readMeta(in: folder.url),
+                manifest: try readManifest(in: folder.url))
         } catch {
             throw .operationFailed("cannot read recording \(id): \(error.localizedDescription)")
         }
-        let meta = try Self.movableMeta(current, id: id)
-        if sameParent && meta.calendar == calendar { return current }
-        var moved = meta
-        moved.calendar = calendar
-        let url = try relocate(found.url, from: meta, to: moved, into: sameParent ? nil : parent)
-        return RecordingFolder(url: url, meta: moved, manifest: nil)
     }
 
     /// Запись по id, которую можно двигать, и её meta по снимку find.
@@ -74,7 +99,7 @@ extension RecordingStore {
         return (found, try Self.movableMeta(found, id: id))
     }
 
-    /// meta записи, которую можно двигать: законченной (meta есть, manifest нет), ручной, вне события.
+    /// meta записи, которую можно двигать: законченной (meta есть, manifest нет) и ручной.
     /// Дважды за move — по снимку find и по свежему чтению под lock'ом.
     private static func movableMeta(_ folder: RecordingFolder, id: String)
         throws(EarmarkError) -> RecordingMeta
@@ -82,19 +107,17 @@ extension RecordingStore {
         // Пока есть manifest, запись идёт или ждёт восстановления: meta ещё перепишут.
         guard !folder.isRecording else { throw .busy("recording \(id) is still in progress") }
         guard let meta = folder.meta else { throw .badData("recording \(id) has no meta.json") }
-        // Запись по событию уже лежит у своего календаря: переложить её — разойтись с событием.
-        guard meta.trigger == .manual, meta.event == nil else {
-            throw .invalidArguments("only manual recordings outside a calendar event can be moved")
-        }
+        // Авто-запись — это и есть встреча своего календаря: переложить её — разойтись с событием.
+        guard meta.trigger == .manual else { throw .invalidArguments("only manual recordings can be moved") }
         return meta
     }
 
-    /// Новая meta, потом папка в parent (nil — папка остаётся). Сбой второго шага откатывает первый:
-    /// снаружи либо переехало всё, либо ничего. Порядок такой ради крэша между шагами: запись с верным
-    /// календарём в старой папке найдёт `recordings --calendar`, а повтор move доделает переезд.
-    private func relocate(_ dir: URL, from old: RecordingMeta, to new: RecordingMeta, into parent: URL?)
-        throws(EarmarkError) -> URL
-    {
+    /// Новая meta, потом папка в parent под именем name (nil — прежнее; parent nil — папка остаётся).
+    /// Сбой второго шага откатывает первый: снаружи либо переехало всё, либо ничего. Порядок такой ради
+    /// крэша между шагами: запись с верным календарём в старой папке найдёт `recordings --calendar`.
+    private func relocate(
+        _ dir: URL, from old: RecordingMeta, to new: RecordingMeta, into parent: URL?, name: String?
+    ) throws(EarmarkError) -> URL {
         let id = new.id
         do {
             if let parent {
@@ -106,7 +129,7 @@ extension RecordingStore {
         }
         guard let parent else { return dir }
         do {
-            return try Self.renameKeepingOthers(dir, into: parent)
+            return try Self.renameKeepingOthers(dir, into: parent, as: name ?? dir.lastPathComponent)
         } catch {
             let reason = error.localizedDescription
             do {
@@ -120,7 +143,8 @@ extension RecordingStore {
         }
     }
 
-    /// rename(2) с RENAME_EXCL под тем же именем, занято — « (2)», « (3)»… как у createRecordingFolder.
+    /// rename(2) с RENAME_EXCL под именем base, занято — « (2)», « (3)»… как у createRecordingFolder.
+    /// Папка уже так и называется — остаётся на месте.
     /// Голый rename молча заменил бы пустую чужую папку с тем же именем; EXCL решает это атомарно,
     /// без гонки «проверил — переименовал».
     ///
@@ -128,13 +152,13 @@ extension RecordingStore {
     /// диск не работал бы вовсе. Там имя резервирует mkdir — он атомарен и на exFAT, — и rename(2)
     /// кладёт запись поверх этой своей пустой папки: пустой каталог rename заменяет атомарно, а в
     /// непустой (кто-то успел туда писать) не идёт — ENOTEMPTY, чужое не тронуто.
-    private static func renameKeepingOthers(_ source: URL, into parent: URL) throws -> URL {
+    private static func renameKeepingOthers(_ source: URL, into parent: URL, as base: String) throws -> URL {
         func failure(_ code: Int32) -> POSIXError { POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO) }
-        let base = source.lastPathComponent
         var exclusive = true
         for attempt in 1...999 {
             let target = parent.appendingPathComponent(
                 attempt == 1 ? base : "\(base) (\(attempt))", isDirectory: true)
+            if target.standardizedFileURL.path == source.standardizedFileURL.path { return source }
             if exclusive {
                 if renamex_np(source.path, target.path, UInt32(RENAME_EXCL)) == 0 { return target }
                 let code = errno

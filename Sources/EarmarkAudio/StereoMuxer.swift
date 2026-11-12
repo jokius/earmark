@@ -26,24 +26,11 @@ public enum StereoMuxer {
         guard !tracks.isEmpty else { throw EarmarkAudioError.noAudio }
         let total = tracks.map(\.end).max() ?? 0
 
-        guard
-            let stereo = AVAudioFormat(
-                commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 2, interleaved: false),
-            let block = AVAudioPCMBuffer(pcmFormat: stereo, frameCapacity: blockFrames),
-            let left = block.floatChannelData?[0], let right = block.floatChannelData?[1]
-        else { throw EarmarkAudioError.invalidOperation("cannot allocate the stereo buffer") }
-
-        // Остаток прошлого падения (audio.partial.m4a) мешает AVAudioFile создать файл заново.
-        try? FileManager.default.removeItem(at: output)
-        let settings: [String: Any] = [
-            AVFormatIDKey: kAudioFormatMPEG4AAC,
-            AVSampleRateKey: sampleRate,
-            AVNumberOfChannelsKey: 2,
-            AVEncoderBitRateKey: 96_000,
-            AVAudioFileTypeKey: kAudioFileM4AType,
-        ]
-        let file = try AVAudioFile(
-            forWriting: output, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false)
+        let file = try makeOutput(output)
+        let block = try makeBlock(for: file)
+        guard let left = block.floatChannelData?[0], let right = block.floatChannelData?[1] else {
+            throw EarmarkAudioError.invalidOperation("cannot allocate the stereo buffer")
+        }
         var position: Int64 = 0
         while position < total {
             let count = Int(min(Int64(blockFrames), total - position))
@@ -57,17 +44,48 @@ public enum StereoMuxer {
         }
         // close() (macOS 15+) дописывает moov; без него m4a нечитаем, а deinit у AVAudioFile не гарантирован.
         file.close()
-
-        // Финализатор после этого удаляет CAF, и всё, чего нет в AAC, теряется насовсем. Поэтому не процент
-        // (1% от часа — 36 с молча), а два AAC-пакета (2 × 1024 кадра) люфта: муксер пишет ровно `total`
-        // кадров (замер: written == total на 221 792, 960 000 и 172 800 000 кадрах).
-        let written = try AVAudioFile(forReading: output).length
-        guard written >= total - 2_048 else {
-            throw EarmarkAudioError.truncatedOutput(expected: total, actual: written)
-        }
+        try verifyLength(of: output, expected: total)
         return AudioInfo(
             file: RecordingFiles.audio, codec: "aac", sampleRate: Int(sampleRate),
             channels: ["mic", "system"], micOffsetMs: micOffsetMs)
+    }
+}
+
+extension StereoMuxer {
+    /// Пустой AAC-LC 48 kHz stereo 96 kbps в `url` — формат audio.m4a у сведения и у склейки.
+    /// Принимает блоки Float32 deinterleaved (`makeBlock`).
+    static func makeOutput(_ url: URL) throws -> AVAudioFile {
+        // Остаток прошлого падения (audio.partial.m4a) мешает AVAudioFile создать файл заново.
+        try? FileManager.default.removeItem(at: url)
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: sampleRate,
+            AVNumberOfChannelsKey: 2,
+            AVEncoderBitRateKey: 96_000,
+            AVAudioFileTypeKey: kAudioFileM4AType,
+        ]
+        return try AVAudioFile(
+            forWriting: url, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false)
+    }
+
+    /// Блок на ~1 с в формате, который принимает `file`.
+    static func makeBlock(for file: AVAudioFile) throws -> AVAudioPCMBuffer {
+        guard let block = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: blockFrames)
+        else {
+            throw EarmarkAudioError.invalidOperation("cannot allocate the stereo buffer")
+        }
+        return block
+    }
+
+    /// После сведения CAF удаляются, после склейки — папка второй записи: всё, чего нет в AAC, теряется
+    /// насовсем. Поэтому не процент (1% от часа — 36 с молча), а два AAC-пакета (2 × 1024 кадра) люфта:
+    /// AVAudioFile пишет ровно `expected` кадров (замер: written == total на 221 792, 960 000 и
+    /// 172 800 000 кадрах).
+    static func verifyLength(of url: URL, expected: Int64) throws {
+        let written = try AVAudioFile(forReading: url).length
+        guard written >= expected - 2_048 else {
+            throw EarmarkAudioError.truncatedOutput(expected: expected, actual: written)
+        }
     }
 }
 

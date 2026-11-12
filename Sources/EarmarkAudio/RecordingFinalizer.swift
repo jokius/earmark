@@ -96,13 +96,21 @@ public enum RecordingFinalizer {
     /// audio.partial.m4a → rename(2) в audio.m4a: rename атомарно заменяет остаток прошлой попытки.
     private static func muxTracks(in folder: URL, micOffsetMs: Int) throws -> AudioInfo {
         let partial = folder.appendingPathComponent(RecordingFiles.audioPartial)
-        let audio = folder.appendingPathComponent(RecordingFiles.audio)
         let info = try StereoMuxer.mux(
             mic: folder.appendingPathComponent(RecordingFiles.mic),
             system: folder.appendingPathComponent(RecordingFiles.system), micOffsetMs: micOffsetMs,
             output: partial)
-        // F_FULLFSYNC до rename, как в AtomicFile: следом удаляются CAF, и после потери питания rename
-        // пережил бы данные — audio.m4a с дырой, второй копии нет. ФС без его поддержки — fsync.
+        try publishAudio(in: folder)
+        return info
+    }
+
+    /// audio.partial.m4a → audio.m4a папки: на диск, потом rename(2).
+    static func publishAudio(in folder: URL) throws {
+        let partial = folder.appendingPathComponent(RecordingFiles.audioPartial)
+        let audio = folder.appendingPathComponent(RecordingFiles.audio)
+        // F_FULLFSYNC до rename, как в AtomicFile: следом удаляются CAF (или папка приклеенной записи),
+        // и после потери питания rename пережил бы данные — audio.m4a с дырой, второй копии нет.
+        // ФС без его поддержки — fsync.
         let fd = open(partial.path, O_RDONLY | O_CLOEXEC)
         guard fd >= 0 else {
             throw EarmarkAudioError.osStatus(operation: "open audio.partial.m4a", status: errno)
@@ -114,7 +122,6 @@ public enum RecordingFinalizer {
         guard rename(partial.path, audio.path) == 0 else {
             throw EarmarkAudioError.osStatus(operation: "rename audio.partial.m4a", status: errno)
         }
-        return info
     }
 
     private static func removeTracks(in folder: URL) {

@@ -27,15 +27,20 @@ final class RecordingSession {
 
     /// Запись сведена и meta.json на диске — после стопа и после восстановления прерванной.
     @ObservationIgnored var onFinalized: ((URL, RecordingMeta) -> Void)?
+    /// Захват закрыт, сведение только начинается: manifest записи и момент стопа. Синхронно, в том же
+    /// ходе main actor, что и stopNow, когда запись уже в finalizing: вопрос о проекте не ждёт сведения.
+    @ObservationIgnored var onStopped: ((RecordingManifest, Date) -> Void)?
     /// Запись отброшена (StopRules.shouldDiscard), папки уже нет: id записи и причина стопа.
     @ObservationIgnored var onDiscarded: ((String, StopReason) -> Void)?
+    /// Сведение упало, manifest остался — запись доделает восстановление при следующем старте. id записи.
+    @ObservationIgnored var onFinalizeFailed: ((String) -> Void)?
     /// Запись началась, ручная или авто. Зовётся раньше предупреждений `capture_failed` этого старта.
     @ObservationIgnored var onStarted: (() -> Void)?
     @ObservationIgnored var onWarning: ((String) -> Void)?
-    /// Записи от стопа до onFinalized/onDiscarded. Сведение пишет meta.json и снимает manifest ещё в
-    /// фоне, до прыжка на main actor: в этом зазоре скан очереди видит обычную recorded-запись и начал
-    /// бы расшифровывать её в Manual раньше вопроса о проекте. Снимается в одном ходе main actor с
-    /// onFinalized, так что удержание переходит к вопросу без щели.
+    /// Записи от стопа до onFinalized/onDiscarded/onFinalizeFailed. Сведение пишет meta.json и снимает
+    /// manifest ещё в фоне, до прыжка на main actor: в этом зазоре скан очереди видит обычную
+    /// recorded-запись и начал бы расшифровывать её раньше ответа о проекте, а move и склейка упёрлись
+    /// бы в папку, которую ещё сводят.
     @ObservationIgnored private(set) var finalizing: Set<String> = []
 
     /// Уровни каналов для CallActivityMonitor: он читает их со своей очереди, без main actor.
@@ -195,6 +200,7 @@ final class RecordingSession {
         let callApps = finished.tracker.callAppsSeen
         let endedAt = Date()
         finalizing.insert(manifest.id)
+        onStopped?(manifest, endedAt)
         return Task.detached(priority: .userInitiated) { [weak self] in
             let result = Result { () throws -> RecordingMeta? in
                 try RecordingFinalizer.finalize(
@@ -244,15 +250,26 @@ final class RecordingSession {
         let keepRawTracks = config().keepRawTracks
         let folders: [RecordingFolder]
         do {
-            // По pid живость не проверяем: второй экземпляр выходит раньше start() (single instance),
-            // значит, писатель любого manifest, кроме своей записи, мёртв. А pid старого писателя после
-            // перезагрузки нередко занят чужим живым процессом — такая запись не восстановилась бы никогда.
-            folders = try store.interrupted { _ in false }
+            folders = try store.list()
         } catch {
             Self.log.error("cannot list interrupted recordings: \(error, privacy: .public)")
             return
         }
-        for folder in folders where folder.url != active?.folder {
+        // Выход посреди склейки оставляет у цели audio.partial.m4a на сотни мегабайт. У законченной
+        // записи его законно не бывает; папки с manifest — дело recover ниже, свой partial он убирает сам.
+        for folder in folders where folder.manifest == nil {
+            let partial = folder.url.appendingPathComponent(RecordingFiles.audioPartial)
+            guard FileManager.default.fileExists(atPath: partial.path) else { continue }
+            do {
+                try FileManager.default.removeItem(at: partial)
+            } catch {
+                Self.log.error("cannot remove \(partial.path, privacy: .public): \(error, privacy: .public)")
+            }
+        }
+        // По pid живость не проверяем: второй экземпляр выходит раньше start() (single instance),
+        // значит, писатель любого manifest, кроме своей записи, мёртв. А pid старого писателя после
+        // перезагрузки нередко занят чужим живым процессом — такая запись не восстановилась бы никогда.
+        for folder in folders where folder.manifest != nil && folder.url != active?.folder {
             guard let manifest = folder.manifest else { continue }
             let url = folder.url
             let result = await Task.detached(priority: .utility) {
@@ -289,6 +306,7 @@ final class RecordingSession {
         case .failure(let error):
             // manifest остался — recoverInterrupted доделает при следующем старте.
             Self.log.error("finalization of \(id, privacy: .public) failed: \(error, privacy: .public)")
+            onFinalizeFailed?(id)
         }
     }
 

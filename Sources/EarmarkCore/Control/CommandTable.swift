@@ -93,6 +93,12 @@ public enum CommandTable {
                 flag("--manual", "Move back to the Manual folder without a calendar"),
             ],
             needsApp: true, mcpTool: "move_recording", readOnly: false),
+        // Склейка необратима: агентам через MCP не отдаём, только CLI по просьбе человека.
+        CommandSpec(
+            path: ["merge"],
+            summary: "Append a recording to the one that ended right before it (within 10 minutes), "
+                + "as if it had never been stopped; the earlier recording's transcripts are redone",
+            arguments: [recordingID], needsApp: true, mcpTool: nil, readOnly: false),
         CommandSpec(
             path: ["transcript"], summary: "Transcript in pages of words; continue with next_offset",
             arguments: [recordingID],

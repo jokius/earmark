@@ -10,6 +10,8 @@ public enum RecordingFiles {
     public static let transcriptMic = "transcript.mic.json", transcriptSystem = "transcript.system.json"
     public static let transcript = "transcript.json", transcriptText = "transcript.txt"
     public static let manualFolder = "Manual"
+    /// Название ручной записи без события — и той, что move увёл от её события.
+    public static let manualTitle = "Manual recording"
 }
 
 /// Папка записи, как её видно с диска.
@@ -17,6 +19,12 @@ public struct RecordingFolder: Equatable, Sendable {
     public let url: URL
     public let meta: RecordingMeta?
     public let manifest: RecordingManifest?
+
+    public init(url: URL, meta: RecordingMeta?, manifest: RecordingManifest?) {
+        self.url = url
+        self.meta = meta
+        self.manifest = manifest
+    }
 
     public var isRecording: Bool { manifest != nil }
 

@@ -28,6 +28,8 @@ Run it first and use only the commands and options it lists. Do not guess flags 
 - "Record my Work calendar", "transcribe in Russian" — `earmark calendars …`, `earmark config set …`.
 - "That last call was for Work", "put it back in Manual" — `earmark move <id> --calendar <id>`,
   `earmark move <id> --manual`.
+- "I stopped the recording by accident, glue it back" — `earmark merge <id>` with the later
+  recording's id.
 
 ## Rules
 
@@ -35,7 +37,8 @@ Run it first and use only the commands and options it lists. Do not guess flags 
   other people may require their consent; never start one on your own initiative.
 - Never delete or edit anything in the recordings folder, and never move files there by hand.
   earmark has no delete command on purpose. `earmark move` files a manual recording under a
-  calendar; run it only when the user asks.
+  calendar, and `earmark merge` appends a recording to the one right before it; run them only
+  when the user asks. A merge cannot be undone.
 - Take recording ids from `earmark recordings` output. Never guess or construct an id.
 - A recording is complete only when its status is not `recording`; a transcript is ready only
   when the status is `transcribed`. Do not read `*.caf` or `*.partial.*` files.

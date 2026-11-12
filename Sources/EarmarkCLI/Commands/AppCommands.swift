@@ -6,8 +6,8 @@ import Foundation
 enum AppCommands {
     /// Обычный ответ app — миллисекунды; 30 с — запас на подвисший EventKit.
     static let defaultTimeout: TimeInterval = 30
-    /// stop отвечает после финализации (свести 3 ч записи в AAC — это минуты), а permissions
-    /// request — когда человек прокликает системные диалоги.
+    /// stop отвечает после финализации (свести 3 ч записи в AAC — это минуты), merge — после
+    /// перекодирования обеих записей, а permissions request — когда человек прокликает системные диалоги.
     static let longTimeout: TimeInterval = 300
 
     /// status никогда не поднимает app: мёртвый сокет — это ответ, а не ошибка (§9.3).
@@ -155,6 +155,16 @@ enum AppCommands {
         }
         return try await send(
             IPCMethod.recordingMove, .object(["id": .string(id), "calendar_id": calendarID]), context)
+    }
+
+    /// Склейка с предыдущей записью через app: он держит очередь и вопрос о проекте. Цель выбирает app.
+    /// Таймаут длинный: склейка перекодирует обе записи, у часового созвона это десятки секунд.
+    static func merge(
+        _ parsed: ParsedCommand, _ context: CLIContext
+    ) async throws(EarmarkError) -> JSONValue {
+        let id = try parsed.argument("id")
+        return try await send(
+            IPCMethod.recordingMerge, .object(["id": .string(id)]), context, timeout: longTimeout)
     }
 
     /// enable/disable — это `config set calendars` с новым списком, своих IPC-методов у них нет.

@@ -8,7 +8,8 @@ struct CommandTableTests {
     /// Все команды спеки §9.3 — таблица обязана содержать ровно их.
     private let specPaths = [
         "status", "start", "stop", "upcoming", "calendars", "calendars enable", "calendars disable",
-        "recordings", "recording", "move", "transcript", "transcribe", "model status", "model download",
+        "recordings", "recording", "move", "merge", "transcript", "transcribe", "model status",
+        "model download",
         "model import",
         "config list", "config get", "config set", "config reset", "doctor", "permissions request", "mcp",
         "help",
@@ -81,6 +82,10 @@ struct CommandTableTests {
                 ParsedCommand(
                     path: ["move"], arguments: ["id": "20261002-1400-a1b2"], options: ["manual": "true"])
             ),
+            (
+                ["merge", "20261002-1432-b2c3"],
+                ParsedCommand(path: ["merge"], arguments: ["id": "20261002-1432-b2c3"])
+            ),
             (["help", "--json"], ParsedCommand(path: ["help"], options: ["json": "true"])),
             ([], ParsedCommand(path: ["help"])),
             (["--help"], ParsedCommand(path: ["help"])),
@@ -103,6 +108,8 @@ struct CommandTableTests {
             (["start", "--title"], "--title requires a value"),
             (["start", "--bogus"], "unknown option --bogus"),
             (["transcribe", "x", "--force=yes"], "--force does not take a value"),
+            (["merge"], "missing required argument <id>. Usage: earmark merge <id>"),
+            (["merge", "a", "b"], "unexpected argument \"b\""),
         ])
     func rejects(argv: [String], fragment: String) {
         let error = #expect(throws: EarmarkError.self) { try CommandTable.parse(argv) }
@@ -132,6 +139,23 @@ struct CommandTableTests {
                 ["name": "id", "help": "Calendar id from `earmark calendars`", "required": true]
             ])
         #expect(enable["mcp_tool"] == "set_calendar_enabled")
+        // склейка необратима: агентам её не даём — MCP-инструмента нет, команда пишущая
+        let merge = try #require(commands.first { $0["path"] == "merge" })
+        #expect(merge["mcp_tool"] == .null)
+        #expect(merge["needs_app"] == true)
+        if case .array(let arguments)? = merge["arguments"] {
+            #expect(arguments.compactMap { $0["name"]?.stringValue } == ["id"])
+        }
+        #expect(
+            merge["summary"]?.stringValue
+                == "Append a recording to the one that ended right before it (within 10 minutes), as if it had "
+                + "never been stopped; the earlier recording's transcripts are redone")
+        let mergeSpec = try #require(CommandTable.all.first { $0.path == ["merge"] })
+        #expect(mergeSpec.mcpTool == nil)
+        #expect(mergeSpec.readOnly == false)
+        // move больше не только для записей вне события
+        let move = try #require(commands.first { $0["path"] == "move" })
+        #expect(move["summary"]?.stringValue?.contains("outside") == false)
         #expect(keys.count == ConfigSchema.all.count)
         #expect(keys.first { $0["key"] == "lead_seconds" }?["range"] == [0, 3600])
     }
@@ -143,7 +167,7 @@ struct CommandTableTests {
         #expect(
             needs == [
                 "start", "upcoming", "calendars", "calendars enable", "calendars disable",
-                "move", "transcribe",
+                "move", "merge", "transcribe",
                 "config set", "config reset", "doctor", "permissions request",
             ])
     }

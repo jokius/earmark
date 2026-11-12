@@ -125,12 +125,18 @@ Recordings go to `~/Earmark`, created with mode 0700. Change it with
 `earmark config set recordings_dir <path>`. Desktop, Documents and Downloads are refused: macOS
 guards them, and every script that reads your recordings would hit permission prompts.
 
-A manual recording made outside any calendar event goes to `Manual`. Once it is finalized, a small
-floating window asks "Which project is this call for?" with a button for every enabled calendar:
-pick one and the recording moves into that calendar's folder, gets tagged with it and is
-transcribed in that calendar's languages. **Keep in Manual** or closing the window leaves it where
-it is. The window does not take focus from your call, and transcription waits for the answer. From
-the CLI: `earmark move <id> --calendar <id>` or `earmark move <id> --manual`.
+A manual recording started during an event of an enabled calendar goes to that calendar's folder,
+any other one to `Manual`. Whenever a manual recording stops, a small floating window asks right
+away, without waiting for the audio to be finalized, "Which project is this call for?": a button
+for every enabled calendar, **Manual**, and **Attach to previous** when the previous recording ended
+at most 10 minutes before this one started. The highlighted button is where the recording is now,
+and closing the window keeps it there. Pick a calendar and the recording moves into that calendar's
+folder, gets tagged with it and is transcribed in that calendar's languages; a recording that came
+from an event is renamed to "Manual recording" and loses the event. **Attach to previous** appends
+the audio to the previous recording as if it had never been stopped, and the whole call is
+transcribed again; this cannot be undone. The window does not take focus from your call, and
+transcription waits for the answer. From the CLI: `earmark move <id> --calendar <id>`,
+`earmark move <id> --manual` or `earmark merge <id>`.
 
 ## CLI
 
@@ -145,6 +151,7 @@ to stderr as `{"schema_version":1,"error":{"code":"…","message":"…","exit_co
 | `earmark start [--title T]` | Start a manual recording. Idempotent: returns the running recording if there is one |
 | `earmark stop` | Stop and finalize; answers once `audio.m4a` is written. Never launches the app: with the app quit nothing is recording, so it answers `null` |
 | `earmark move <id> --calendar ID`, `earmark move <id> --manual` | File a manual recording under a calendar: it moves into the calendar's folder and gets its `calendar`. `--manual` moves it back. Transcripts are kept; `earmark transcribe <id> --force` redoes them in the calendar's languages |
+| `earmark merge <id>` | Append a recording to the one that ended at most 10 minutes before it started, as if it had never been stopped. The earlier recording keeps its id and is transcribed again; the later one disappears. Cannot be undone |
 | `earmark upcoming [--hours 24]` | Events that will be recorded |
 | `earmark calendars` | Calendars with `enabled`, account and folder |
 | `earmark calendars enable <id>`, `earmark calendars disable <id>` | Turn auto-recording on or off for a calendar |
@@ -161,7 +168,7 @@ to stderr as `{"schema_version":1,"error":{"code":"…","message":"…","exit_co
 | `earmark mcp` | stdio MCP server |
 | `earmark help [--json]` | The command table |
 
-Commands that need the app — start, move, upcoming, calendars, `config set` and `config reset`,
+Commands that need the app — start, move, merge, upcoming, calendars, `config set` and `config reset`,
 `transcribe` without `--now`, doctor and `permissions request` — launch it with
 `open -g -b com.konayre.earmark` when it is not running and wait up to 5 seconds. Everything else
 reads plain files and works without the app.

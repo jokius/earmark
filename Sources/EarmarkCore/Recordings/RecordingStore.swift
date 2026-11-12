@@ -142,7 +142,7 @@ public struct RecordingStore: Sendable {
         let parent = root.appendingPathComponent(
             Self.sanitize(calendarFolder ?? RecordingFiles.manualFolder), isDirectory: true)
         try fm.createDirectory(at: parent, withIntermediateDirectories: true)
-        let base = Self.stamp(startedAt, "yyyy-MM-dd HH-mm", timeZone) + " " + Self.sanitize(title)
+        let base = Self.folderBaseName(title: title, startedAt: startedAt, timeZone: timeZone)
         for attempt in 1...999 {
             let folder = parent.appendingPathComponent(
                 attempt == 1 ? base : "\(base) (\(attempt))", isDirectory: true)
@@ -150,6 +150,12 @@ public struct RecordingStore: Sendable {
             guard errno == EEXIST else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
         }
         throw POSIXError(.EEXIST)
+    }
+
+    /// "yyyy-MM-dd HH-mm " + sanitize(title) — имя папки записи без суффикса коллизии; его же получает
+    /// запись, которую move снял с события.
+    static func folderBaseName(title: String, startedAt: Date, timeZone: TimeZone = .current) -> String {
+        stamp(startedAt, "yyyy-MM-dd HH-mm", timeZone) + " " + sanitize(title)
     }
 
     /// Даты в именах — в григорианском календаре и POSIX-локали: иначе на Mac с буддийским

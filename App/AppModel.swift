@@ -1,4 +1,5 @@
 import AppKit
+import EarmarkAudio
 import EarmarkCore
 import Observation
 import os
@@ -29,9 +30,12 @@ final class AppModel {
     /// Предупреждения записи (`capture_failed:…`, `far_end_digital_silence`, `start_failed:…`,
     /// `finalize_failed:…`) — в status.warnings. Сбрасываются на каждом старте записи.
     private(set) var recordingWarnings: [String] = []
-    /// Ручные записи, по которым ждём ответа «какой проект?», по порядку остановки. Очередь не берёт
-    /// их из бэклога. Только в памяти: после перезапуска запись просто расшифруется в Manual.
-    private(set) var awaitingProject: [String] = []
+    /// Открытые вопросы «какой проект?» по ручным записям, по порядку остановки. Очередь не берёт из
+    /// бэклога ни эти записи, ни их кандидатов на склейку. Только в памяти: после перезапуска запись
+    /// просто расшифруется там, где лежит.
+    private(set) var projectQuestions: [ProjectQuestion] = []
+    /// Записи, которые сейчас склеиваются: очередь их не берёт, move и вторая склейка — busy.
+    @ObservationIgnored private var merging: Set<String> = []
     @ObservationIgnored private lazy var projectPanels = ProjectPanels(model: self)
 
     var isRecording: Bool { session.isRecording }
@@ -57,7 +61,7 @@ final class AppModel {
         // метаданными (trigger остаётся manual) и делает его handled (§5).
         let meeting = scheduler?.currentMeeting()
         let request = RecordingSession.StartRequest(
-            trigger: .manual, title: title ?? meeting?.title ?? "Manual recording", meeting: meeting,
+            trigger: .manual, title: title ?? meeting?.title ?? RecordingFiles.manualTitle, meeting: meeting,
             calendarFolder: meeting.flatMap { scheduler?.folderName(for: $0.calendar) })
         recordingWarnings = []
         let info: CurrentRecordingInfo
@@ -134,26 +138,34 @@ final class AppModel {
             store: { [weak self] in RecordingStore(root: (self?.config ?? Config()).recordingsDir) },
             config: { [weak self] in self?.config ?? Config() },
             isRecording: { [weak self] in self?.session.isRecording ?? false },
-            // Держим, пока запись сводится, и дальше, пока ждёт ответа «какой проект?»: finalizing
-            // снимается в одном ходе с onFinalized, а тот сразу кладёт запись в awaitingProject.
+            // Держим, пока запись сводится или склеивается, и пока ждёт ответа «какой проект?» она
+            // сама или запись, которая предлагает приклеиться к ней: иначе очередь расшифровала бы
+            // предыдущую сразу после стопа, а склейка всё переделала бы или упёрлась в lock.
             isHeld: { [weak self] id in
                 guard let self else { return false }
-                return self.session.finalizing.contains(id) || self.awaitingProject.contains(id)
+                return self.session.finalizing.contains(id) || self.merging.contains(id)
+                    || self.projectQuestions.contains { $0.id == id || $0.mergeTarget?.id == id }
             },
             provisioner: provisioner, worker: Self.cliExecutable)
         self.queue = queue
         provisioner.onReady = { [weak queue] in queue?.requestScan() }
-        // Колбэки сеанса — только здесь (D33). onFinalized один на троих: re-arm смотрит причину
-        // стопа, вопрос о проекте удерживает ручную запись, очередь ставит запись в работу. Вопрос —
-        // раньше скана: иначе очередь успела бы взять запись до удержания.
+        // Колбэки сеанса — только здесь (D33). Вопрос о проекте открывается при стопе, не дожидаясь
+        // сведения; ответ, данный раньше конца сведения, применяется после него. onFinalized один на
+        // троих: re-arm смотрит причину стопа, отложенный ответ кладёт запись на место, очередь ставит
+        // её в работу.
+        session.onStopped = { [weak self] manifest, endedAt in
+            self?.recordingStopped(manifest, endedAt: endedAt)
+        }
         session.onFinalized = { [weak self, weak scheduler, weak queue] _, meta in
             scheduler?.recordingFinalized(meta)
-            self?.recordingFinalized(meta)
+            self?.applyProjectAnswers()
             queue?.requestScan()
         }
-        session.onDiscarded = { [weak scheduler] id, reason in
+        session.onDiscarded = { [weak self, weak scheduler] id, reason in
             scheduler?.recordingDiscarded(id: id, reason: reason)
+            self?.recordingGone(id)
         }
+        session.onFinalizeFailed = { [weak self] id in self?.recordingGone(id) }
         // Восстановленные при старте записи уходят в очередь, как только сведены (§4.3, D33).
         Task { [weak self, weak queue] in
             await self?.session.recoverInterrupted()
@@ -240,20 +252,98 @@ final class AppModel {
 
     // MARK: - проект ручной записи
 
-    /// Ручная запись вне событий сведена: спросить, к какому календарю она относится. Нечего
-    /// предложить (ни одного включённого календаря в EventKit) — не спрашиваем.
-    func recordingFinalized(_ meta: RecordingMeta) {
-        guard meta.needsProject, !awaitingProject.contains(meta.id) else { return }
+    /// Ручная запись остановлена: спросить проект сразу, не дожидаясь сведения. Правило то же, что
+    /// RecordingMeta.needsProject: из stopNow восстановленных записей не бывает. Нечего предложить — ни
+    /// включённого календаря, ни записи для склейки — не спрашиваем.
+    func recordingStopped(_ manifest: RecordingManifest, endedAt: Date) {
+        guard manifest.trigger == .manual, !projectQuestions.contains(where: { $0.id == manifest.id }) else {
+            return
+        }
         let calendars = projectCalendars()
-        guard !calendars.isEmpty else { return }
-        awaitingProject.append(meta.id)
-        projectPanels.show(meta, calendars: calendars)
+        var previous: RecordingFolder?
+        do {
+            previous = try RecordingStore(root: config.recordingsDir)
+                .mergeTarget(id: manifest.id, startedAt: manifest.startedAt)
+        } catch {
+            logger.error(
+                "merge target of \(manifest.id, privacy: .public): \(error.message, privacy: .public)")
+        }
+        guard !calendars.isEmpty || previous?.meta != nil else { return }
+        let question = ProjectQuestion(
+            id: manifest.id, title: manifest.title, startedAt: manifest.startedAt, endedAt: endedAt,
+            calendar: manifest.calendar, mergeTarget: previous?.meta)
+        projectQuestions.append(question)
+        projectPanels.show(question, calendars: calendars)
     }
 
     /// Включённые календари в порядке config.calendars (это и приоритет) — кнопки вопроса о проекте.
     func projectCalendars() -> [CalendarListItem] {
         let all = calendarsList()
         return config.calendars.compactMap { id in all.first { $0.id == id } }
+    }
+
+    /// Ответ с панели. Выбор того, где запись уже лежит, просто снимает вопрос. Остальное применяется,
+    /// когда запись (и цель склейки) сведена; до тех пор кнопки гаснут, а панель пишет «Saving…».
+    func answerProject(id: String, _ answer: ProjectAnswer) {
+        guard let question = projectQuestions.first(where: { $0.id == id }), question.pending == nil else {
+            return
+        }
+        if answer == .move(question.calendar?.id) {
+            stopAwaitingProject(id)
+            return
+        }
+        setProjectAnswer(id, pending: answer, error: nil)
+        applyProjectAnswers()
+    }
+
+    /// Крестик панели: запись остаётся, где лежит. false — выбор уже сохраняется, закрывать нельзя.
+    func closeProjectQuestion(id: String) -> Bool {
+        guard projectQuestions.first(where: { $0.id == id })?.pending == nil else { return false }
+        stopAwaitingProject(id)
+        return true
+    }
+
+    /// Отложенные ответы, чьи записи больше не сводятся. Зовётся после ответа и после каждого конца
+    /// сведения: удачного, отброшенного и упавшего.
+    private func applyProjectAnswers() {
+        // Цикл идёт по копии: удачный ответ убирает вопрос из projectQuestions.
+        for question in projectQuestions {
+            guard let answer = question.pending, !session.finalizing.contains(question.id),
+                !merging.contains(question.id)
+            else { continue }
+            switch answer {
+            case .move(let calendarID):
+                do {
+                    _ = try moveRecording(id: question.id, calendarID: calendarID)
+                } catch {
+                    setProjectAnswer(question.id, pending: nil, error: error.message)
+                }
+            case .merge:
+                guard let target = question.mergeTarget?.id, !session.finalizing.contains(target),
+                    !merging.contains(target)
+                else { continue }
+                do {
+                    // Сбой склейки снимает ответ в mergeFinished.
+                    _ = try startMerge(question.id, into: target)
+                } catch {
+                    setProjectAnswer(question.id, pending: nil, error: error.message)
+                }
+            }
+        }
+    }
+
+    private func setProjectAnswer(_ id: String, pending: ProjectAnswer?, error: String?) {
+        guard let index = projectQuestions.firstIndex(where: { $0.id == id }) else { return }
+        projectQuestions[index].pending = pending
+        projectQuestions[index].error = error
+        projectPanels.setSaving(id, pending != nil)
+    }
+
+    /// Запись отброшена при сведении или сведение упало: вопрос и отложенный выбор забываются.
+    /// Упавшую доделает восстановление при следующем старте, а восстановленные не спрашиваем.
+    private func recordingGone(_ id: String) {
+        stopAwaitingProject(id)
+        applyProjectAnswers()
     }
 
     /// Панель, CLI и агент. nil — обратно в Manual. Ответ — `{id, path, calendar}`.
@@ -269,9 +359,9 @@ final class AppModel {
             folder = RecordingStore.calendarFolderName(
                 for: info, override: config.folderOverride(forCalendar: info.id), allCalendars: all)
         }
-        // meta.json уже на диске, а onFinalized ещё не пришёл: store.move прошёл бы, а следом
-        // recordingFinalized открыл бы вопрос по старой meta для уже переложенной записи.
-        if session.finalizing.contains(id) {
+        // meta.json уже на диске, а сведение ещё не кончилось: следом оно удаляет CAF по старому пути,
+        // и в переехавшей папке остались бы сырые дорожки. Склейка переписывает папку целиком.
+        if session.finalizing.contains(id) || merging.contains(id) {
             throw EarmarkError.busy("recording \(id) is still in progress")
         }
         // Воркер этой записи держит .transcribe.lock, и store.move ответил бы тем же busy — но с
@@ -289,15 +379,90 @@ final class AppModel {
         ])
     }
 
-    /// «Keep in Manual» и крестик панели: запись остаётся на месте и уходит в очередь.
-    func keepInManual(id: String) {
-        stopAwaitingProject(id)
+    /// CLI: приклеить запись к той, что закончилась прямо перед ней (не раньше mergeWindow до её старта).
+    /// Ответ — `{id, merged, path}`: id и папка записи, которая осталась.
+    func mergeRecording(id: String) async throws(EarmarkError) -> JSONValue {
+        let store = RecordingStore(root: config.recordingsDir)
+        let found: RecordingFolder?
+        do {
+            found = try store.find(id: id)
+        } catch {
+            throw EarmarkError.operationFailed("cannot read recordings: \(error.localizedDescription)")
+        }
+        guard let found else {
+            throw EarmarkError.notFound("no recording \(id); take ids from `earmark recordings`")
+        }
+        guard !session.finalizing.contains(id), !found.isRecording, let meta = found.meta else {
+            throw EarmarkError.busy("recording \(id) is still in progress")
+        }
+        guard let target = try store.mergeTarget(id: id, startedAt: meta.startedAt)?.id else {
+            throw EarmarkError.notFound(
+                "no recording ended within \(Int(RecordingStore.mergeWindow / 60)) minutes before \(id) "
+                    + "to attach it to")
+        }
+        let merged = try await startMerge(id, into: target).value.get()
+        return .object(["id": .string(target), "merged": .string(id), "path": .string(merged.url.path)])
     }
 
-    /// Любой ответ снимает удержание: панель закрывается (и та, что открыта, когда ответили из CLI),
+    /// Склейка вне main actor: перекодирование часового созвона — десятки секунд. Проверки и пометка
+    /// merging — сразу, в этом же ходе: два ответа подряд не запустят две склейки.
+    private func startMerge(_ id: String, into target: String)
+        throws(EarmarkError) -> Task<Result<RecordingFolder, EarmarkError>, Never>
+    {
+        for recording in [id, target] {
+            if session.finalizing.contains(recording) || merging.contains(recording) {
+                throw EarmarkError.busy("recording \(recording) is still in progress")
+            }
+            // Как у move: lock держит наш воркер, а не чужой процесс.
+            if queue?.runningID == recording {
+                throw EarmarkError.busy(
+                    "recording \(recording) is being transcribed; merge it when transcription finishes")
+            }
+        }
+        merging.formUnion([id, target])
+        let store = RecordingStore(root: config.recordingsDir)
+        return Task { [weak self] in
+            let result = await Task.detached(priority: .userInitiated) {
+                Result { () throws(EarmarkError) -> RecordingFolder in
+                    try RecordingMerger.merge(id, into: target, store: store)
+                }
+            }.value
+            self?.mergeFinished(id, into: target, result)
+            return result
+        }
+    }
+
+    /// Ответы, отложенные, пока id и target склеивались, применяются здесь же: иначе «Saving…» навсегда.
+    private func mergeFinished(
+        _ id: String, into target: String, _ result: Result<RecordingFolder, EarmarkError>
+    ) {
+        merging.subtract([id, target])
+        switch result {
+        case .success(let folder):
+            // Вопрос, предлагавший приклеиться к id, теперь клеит к target: id в нём растворилась.
+            // Вопрос самой target остаётся: на него ещё не ответили.
+            for index in projectQuestions.indices where projectQuestions[index].mergeTarget?.id == id {
+                projectQuestions[index].mergeTarget = folder.meta
+            }
+            stopAwaitingProject(id)
+        case .failure(let error):
+            // В том же ходе, что снятие merging: иначе applyProjectAnswers запустил бы ту же склейку снова.
+            // «Attach to previous» убираем: после сбоя на полпути повтор дописал бы вторую часть дважды.
+            // Нарочно повторить можно `earmark merge`. Выбор .move, сделанный во время склейки из CLI, живёт.
+            if let index = projectQuestions.firstIndex(where: { $0.id == id }) {
+                projectQuestions[index].mergeTarget = nil
+                let pending = projectQuestions[index].pending
+                setProjectAnswer(id, pending: pending == .merge ? nil : pending, error: error.message)
+            }
+            queue?.requestScan()
+        }
+        applyProjectAnswers()
+    }
+
+    /// Любой ответ снимает вопрос: панель закрывается (и та, что открыта, когда ответили из CLI),
     /// очередь сканирует заново.
     private func stopAwaitingProject(_ id: String) {
-        awaitingProject.removeAll { $0 == id }
+        projectQuestions.removeAll { $0.id == id }
         projectPanels.close(id)
         queue?.requestScan()
     }

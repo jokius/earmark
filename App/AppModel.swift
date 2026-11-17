@@ -643,6 +643,7 @@ final class AppModel {
                 name: "cli", ok: cli != nil, detail: cli ?? "earmark CLI is missing from Contents/Helpers"))
         checks.append(diskCheck())
         checks.append(loginItemCheck())
+        if let remote = await remoteCheck() { checks.append(remote) }
         if audioTest {
             do {
                 checks.append(try await self.audioTest())
@@ -650,7 +651,29 @@ final class AppModel {
                 checks.append(DoctorCheck(name: "audio_test", ok: false, detail: error.message))
             }
         }
-        return DoctorReport(ready: checks.allSatisfy(\.ok), checks: checks)
+        // Удалённое распознавание на ready не влияет: при любом его сбое воркер распознаёт локально.
+        return DoctorReport(
+            ready: checks.allSatisfy { $0.ok || $0.name == Self.remoteCheckName }, checks: checks)
+    }
+
+    private static let remoteCheckName = "remote_transcription"
+
+    /// Только при включённом transcription.remote.enabled: настроен ли, отвечает ли сервер, подошёл ли
+    /// токен и те же ли у него whisper.cpp и модели. nil — режим выключен, чека нет.
+    private func remoteCheck() async -> DoctorCheck? {
+        guard let setup = RemoteTranscription.client(config: config, supportDir: EarmarkPaths.supportDir)
+        else { return nil }
+        let fallback = "; recordings are transcribed locally"
+        do {
+            let client = try setup.get()
+            let health = try await client.checkCompatible()
+            let gpu = health.gpu.isEmpty ? "" : " on \(health.gpu)"
+            return DoctorCheck(
+                name: Self.remoteCheckName, ok: true,
+                detail: "\(client.baseURL.absoluteString): whisper \(health.whisper)\(gpu)")
+        } catch {
+            return DoctorCheck(name: Self.remoteCheckName, ok: false, detail: error.message + fallback)
+        }
     }
 
     /// CLI в бандле (он же воркер транскрипции) лежит в Contents/Helpers (Task 1, D1). Не через

@@ -9,10 +9,11 @@
 A macOS menu bar app that records your calls: your microphone and the other side (system
 audio) go to separate channels. It starts on its own a minute before an event from the
 calendars you pick, stops when the call app lets go of the microphone, files the recording into
-that calendar's folder and transcribes it locally with whisper.cpp into a "Me / Them" dialogue.
+that calendar's folder and transcribes it locally with whisper.cpp into a "Me / Them" dialogue
+(or, if you turn it on, on your own GPU machine in the same network).
 Like [Anarlog](https://github.com/fastrepl/anarlog), without the frills: no AI summaries, no
-cloud. A small Settings window picks calendars and languages; everything else is driven by the
-`earmark` command line, by you or by your coding agent.
+cloud. A small Settings window picks calendars, languages and the optional transcription server;
+everything else is driven by the `earmark` command line, by you or by your coding agent.
 
 ## Features
 
@@ -28,22 +29,25 @@ cloud. A small Settings window picks calendars and languages; everything else is
   app mid-recording works the same way: the next launch finishes the recording.
 - **One folder per calendar**: `~/Earmark/<Calendar>/2026-10-02 14-00 Daily sync/`.
 - **Local transcription** with whisper.cpp and large-v3-turbo (beam search, voice activity
-  detection), in a separate process after the call.
+  detection), in a separate process after the call. Optionally on
+  [your own NVIDIA GPU server](#transcribing-on-another-machine) in the same network, with the
+  same whisper.cpp, model and parameters; when it is unreachable, the Mac transcribes as usual.
 - **CLI for everything** — settings, status, recordings, transcripts — with JSON output, plus a
   skill for Claude Code and an MCP server for Codex and other MCP clients.
 
 ## What it deliberately does not do
 
 - No AI summaries or notes, no meeting reminders, no cloud and no sync.
-- No transcript editor, and Settings covers only calendars and languages: the rest is the menu bar
-  icon and the CLI.
+- No transcript editor, and Settings covers only calendars, languages and the transcription server:
+  the rest is the menu bar icon and the CLI.
 - No post-recording hooks: wait for `audio.m4a` or `transcript.json` to appear, or poll
   `earmark recordings --status transcribed`.
 - No speaker diarization yet: everyone on the far end is "Them".
 - No echo filtering yet: on speakers the far end's voice leaks into your microphone and shows up
   as "Me" too. Use headphones.
 - No network access except the one-time download of the Whisper model from Hugging Face
-  (`earmark model import` avoids even that).
+  (`earmark model import` avoids even that) and, only if you turn it on, your own transcription
+  server in your network. That mode is off by default.
 
 ## Requirements
 
@@ -202,6 +206,8 @@ while the app is running take effect only after a restart.
 | `audio.keep_raw_tracks` | bool | `false` | Keep `mic.caf` and `system.caf` after muxing |
 | `transcription.enabled` | bool | `true` | Transcribe after each recording |
 | `transcription.language` | string | `auto` | `auto`, a Whisper language code (`ru`) or a comma-separated list (`ru,en,az`) picked per speech fragment |
+| `transcription.remote.enabled` | bool | `false` | Transcribe on your own whisper server in the network instead of this Mac, with a local fallback. See [Transcribing on another machine](#transcribing-on-another-machine) |
+| `transcription.remote.url` | string | — | Base URL of that server, e.g. `http://gpu-box.local:8178` |
 | `transcript.label_me` | string | `Me` | My label in `transcript.txt` |
 | `transcript.label_them` | string | `Them` | Their label in `transcript.txt` |
 
@@ -210,6 +216,45 @@ directory, which is handy for a development build. The app reads it too, so star
 same value: `open --env EARMARK_HOME="$EARMARK_HOME" -b com.konayre.earmark`. Keep the path
 short: `$EARMARK_HOME/earmark.sock` must fit into 103 bytes, the macOS limit for a Unix socket
 path, or the app will not open its socket.
+
+## Transcribing on another machine
+
+Optional and off by default. If you have a Linux box (or Windows with WSL2) with an NVIDIA GPU in
+the same network, earmark can send the transcription work there. Recording, the queue, files and
+the Settings window stay on the Mac; only the whisper.cpp calls move.
+
+- **Same result as on the Mac.** The server is a thin wrapper in [`server/`](server/) around the
+  same whisper.cpp commit as the app (v1.9.4), with the same model file, the same parameters and
+  the same per-fragment language detection; the language logic itself still runs on the Mac. Before
+  sending any audio the Mac checks the server's whisper.cpp commit and the sha256 of both models and
+  refuses a server that differs. GPU arithmetic differs between CUDA and Metal, so a rare hard
+  fragment may still come out slightly differently.
+- **Falls back to the Mac.** Server off, unreachable (the laptop is away from home), wrong token,
+  an error, or no progress for too long — the same recording is transcribed locally, nothing is
+  lost or stuck. A one-hour call is one long streamed request with a heartbeat, so it does not hit
+  an HTTP timeout.
+- **What goes over the network**: the decoded audio of each channel (16 kHz PCM) and the resulting
+  text, over plain HTTP. Before it sends the token or any audio, the Mac makes the server prove it
+  holds the shared token (an HMAC of a fresh random challenge), so a device that merely answers to
+  the same name or address in another network, say in a hotel, gets neither, and the recording is
+  transcribed locally. The check runs once per recording, so switching networks in the middle of
+  a transcription is not covered. The traffic itself, the token included, is not encrypted, so
+  anyone who can watch your home network can read it: use the mode only in a network you trust. The server keeps no audio or text
+  on disk; its log has only per-request metadata (client address, audio length, language, time).
+
+Setup, from this repository on the Mac (needs ssh access to the server; it installs the CUDA toolkit
+if it is missing, copies the model and builds the server there):
+
+```sh
+server/deploy.sh <ssh-host> gpu-box.local       # build, install as a systemd --user service, start
+earmark config set transcription.remote.url http://gpu-box.local:8178
+earmark config set transcription.remote.enabled true
+earmark doctor                                   # remote_transcription: whisper 1.9.4 on <GPU>
+```
+
+The token is generated by `deploy.sh` and stored in
+`~/Library/Application Support/earmark/remote-token` (mode 0600) on the Mac and next to the server.
+The same switch and URL are in Settings, which also shows whether the server answers.
 
 ## Agents
 
@@ -250,9 +295,12 @@ apply to you before relying on auto-recording, and let the other participants kn
 stays visible: its menu bar icon changes while it records, and macOS shows its own microphone
 indicator.
 
-Everything stays on your Mac. Recordings live in `~/Earmark` (mode 0700) and are never uploaded;
-transcription runs locally. The system audio channel captures everything your Mac plays except
-earmark itself — notification sounds and music included.
+By default everything stays on your Mac. Recordings live in `~/Earmark` (mode 0700) and are never
+uploaded; transcription runs locally. The one exception is opt-in: with
+`transcription.remote.enabled` the audio of each recording is sent over your local network to the
+transcription server you set up yourself, and only after that server proves it holds your token (see
+[Transcribing on another machine](#transcribing-on-another-machine)). The system audio channel
+captures everything your Mac plays except earmark itself — notification sounds and music included.
 
 ## Troubleshooting
 

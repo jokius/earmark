@@ -21,13 +21,25 @@ public struct Transcriber: Sendable {
     private let config: Config
     private let makeEngine: EngineFactory
 
-    public init(store: RecordingStore, modelPath: URL, vadModelPath: URL, config: Config) {
-        self.init(store: store, config: config) { () async throws(EarmarkError) -> any SpeechEngine in
+    /// remote — сервер whisper в LAN: каналы идут туда, а при любом его сбое — локально (модель
+    /// тогда грузится только при первом фолбэке).
+    public init(
+        store: RecordingStore, modelPath: URL, vadModelPath: URL, config: Config,
+        remote: RemoteWhisperClient? = nil
+    ) {
+        let local: EngineFactory = { () async throws(EarmarkError) -> any SpeechEngine in
             // Загрузка модели блокирует 1–2 с, а первый запуск нового бинаря ещё ~20 с компилирует
             // шейдеры Metal — не в кооперативном пуле.
             try await DedicatedThread.run("whisper load") { () throws(EarmarkError) -> WhisperEngine in
                 try WhisperEngine(modelPath: modelPath, vadModelPath: vadModelPath)
             }
+        }
+        guard let remote else {
+            self.init(store: store, config: config, makeEngine: local)
+            return
+        }
+        self.init(store: store, config: config) {
+            FallbackSpeechEngine(remote: RemoteWhisperEngine(client: remote), local: local)
         }
     }
 

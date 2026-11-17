@@ -2,6 +2,7 @@ import EarmarkCore
 import EarmarkTranscription
 import Foundation
 import Synchronization
+import os
 
 /// `earmark transcribe <id> --now [--force]`: воркер, которого app запускает отдельным процессом
 /// (§8.3). Тот же вход годится человеку и агенту. Прогресс — JSON-строками в stdout по ходу работы,
@@ -32,7 +33,8 @@ enum TranscribeNowCommand {
         let stop = StopSignalFlag.install()
         let output = context.output
         let transcript = try await Transcriber(
-            store: job.store, modelPath: job.model, vadModelPath: job.vad, config: config
+            store: job.store, modelPath: job.model, vadModelPath: job.vad, config: config,
+            remote: remoteClient(config)
         ).run(
             folder: job.folder.url, force: parsed.flag("force"),
             progress: { progress in
@@ -74,6 +76,21 @@ enum TranscribeNowCommand {
                     + "or EARMARK_VAD_MODEL")
         }
         return Job(store: store, folder: folder, model: model, vad: vadModel)
+    }
+
+    /// Сервер whisper в LAN, если режим включён и настроен. Не настроен — причина в лог, распознаём
+    /// локально: модель и VAD locate уже потребовал, фолбэку они нужны всегда.
+    private static func remoteClient(_ config: Config) -> RemoteWhisperClient? {
+        switch RemoteTranscription.client(config: config, supportDir: EarmarkPaths.supportDir) {
+        case .success(let client)?:
+            return client
+        case .failure(let error)?:
+            Logger(subsystem: EarmarkPaths.bundleID, category: "transcription").error(
+                "remote transcription is not used: \(error.message, privacy: .public)")
+            return nil
+        case nil:
+            return nil
+        }
     }
 
     /// Итог для конверта: сам текст читают через `earmark transcript <id>`, здесь — только сводка.

@@ -81,6 +81,16 @@ public struct Config: Equatable, Sendable {
         if let id, case .string(let own)? = values["calendar.\(id).language"] { language = own }
         return TranscriptionLanguage(language)?.raw ?? language
     }
+
+    public var remoteTranscriptionEnabled: Bool { bool("transcription.remote.enabled") }
+
+    /// nil — не задан. Канонизируем и здесь: Config(values:) собирают и в обход set.
+    public var remoteTranscriptionURL: URL? {
+        guard let url = try? ConfigSchema.remoteURL(string("transcription.remote.url"), key: ""), !url.isEmpty
+        else { return nil }
+        return URL(string: url)
+    }
+
     public var labelMe: String { string("transcript.label_me") }
     public var labelThem: String { string("transcript.label_them") }
 

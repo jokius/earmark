@@ -15,61 +15,31 @@ protocol SpeechEngine: Sendable {
     ) async throws(EarmarkError) -> [RawSegment]
 }
 
-extension EarmarkError {
-    /// Вытеснение (SIGTERM от app) или отмена. Не ошибка записи: попытка не засчитывается,
-    /// а exit 75 значит для очереди «повтори позже».
-    static let interrupted = EarmarkError(
-        code: "interrupted", message: "transcription interrupted (signal or cancellation)", exitCode: .busy)
+/// Примитивы whisper, над которыми одна на оба движка оркестрация (decode / decodeMulti / slice):
+/// у WhisperEngine — C-вызовы, у RemoteWhisperEngine — HTTP к серверу с тем же whisper.cpp.
+/// Синхронные: оркестрация целиком идёт на DedicatedThread. Значения сырые, как их отдаёт whisper
+/// (сантисекунды, текст как есть): перевод в мс и обрезка текста — в оркестрации, одним кодом.
+protocol WhisperPrimitives {
+    /// Отрезки речи Silero VAD с дефолтами (контекст n_threads = threads). shouldAbort нужен удалённому
+    /// запросу; C-вызов VAD прервать нечем.
+    func vad(_ samples: [Float], threads: Int32, shouldAbort: @escaping @Sendable () -> Bool)
+        throws(EarmarkError) -> [RemoteVADSpan]
+    /// Вероятности всех языков whisper для куска; пустой кусок — [:]. shouldAbort — как у vad.
+    func languageProbabilities(
+        _ samples: ArraySlice<Float>, threads: Int32, shouldAbort: @escaping @Sendable () -> Bool
+    ) throws(EarmarkError) -> [String: Float]
+    /// Один whisper_full с эталонными параметрами; время — от начала samples.
+    func whisperFull(_ samples: ArraySlice<Float>, _ params: WhisperParams, _ callbacks: Callbacks)
+        throws(EarmarkError) -> [RemoteSegment]
 }
 
-/// whisper.cpp внутри воркера `earmark transcribe --now`, никогда в app: ggml на любом assert
-/// делает abort(), а после whisper_free в процессе остаётся ~233 MB.
-///
-/// Один контекст на оба канала: модель грузится один раз.
-public final class WhisperEngine: SpeechEngine, @unchecked Sendable {
-    /// whisper_context нельзя трогать из двух потоков сразу (whisper.h). Transcriber и так ходит
-    /// по каналам последовательно; lock делает @unchecked Sendable честным.
-    private let lock = NSLock()
-    private let context: OpaquePointer
-    private let vadModelPath: String
-
-    /// Модель и VAD не загрузились — unavailable: виновата машина, а не запись (попытка не считается).
-    public init(modelPath: URL, vadModelPath: URL) throws(EarmarkError) {
-        guard FileManager.default.fileExists(atPath: vadModelPath.path) else {
-            throw .unavailable("VAD model not found: \(vadModelPath.path)")
-        }
-        Self.silenceLogsUnlessAsked()
-        var params = whisper_context_default_params()
-        params.use_gpu = true
-        params.flash_attn = true
-        guard let context = whisper_init_from_file_with_params(modelPath.path, params) else {
-            throw .unavailable("whisper.cpp failed to load the model \(modelPath.path)")
-        }
-        self.context = context
-        self.vadModelPath = vadModelPath.path
-    }
-
-    deinit { whisper_free(context) }
-
+extension WhisperPrimitives {
     /// Один язык или auto — весь канал одним вызовом whisper_full: резка ради памяти меняет границы
     /// окон, а паритет с эталоном при ней не проверен (§8.1). Список языков — по прогонам (decodeMulti).
-    public func transcribe(
-        _ samples: [Float], params: WhisperParams, progress: @escaping @Sendable (Int) -> Void,
-        shouldAbort: @escaping @Sendable () -> Bool
-    ) async throws(EarmarkError) -> [RawSegment] {
-        guard !samples.isEmpty else { return [] }
-        let callbacks = Callbacks(progress: progress, shouldAbort: shouldAbort)
-        return try await DedicatedThread.run("whisper") { () throws(EarmarkError) -> [RawSegment] in
-            try self.decode(samples, params, callbacks)
-        }
-    }
-
-    private func decode(_ samples: [Float], _ params: WhisperParams, _ callbacks: Callbacks)
+    func decode(_ samples: [Float], _ params: WhisperParams, _ callbacks: Callbacks)
         throws(EarmarkError)
         -> [RawSegment]
     {
-        lock.lock()
-        defer { lock.unlock() }
         guard case .multi(let languages)? = TranscriptionLanguage(params.language) else {
             return try full(samples[...], params, callbacks)
         }
@@ -82,12 +52,14 @@ public final class WhisperEngine: SpeechEngine, @unchecked Sendable {
     private func decodeMulti(
         _ samples: [Float], _ params: WhisperParams, _ languages: [String], _ callbacks: Callbacks
     ) throws(EarmarkError) -> [RawSegment] {
-        let chunks = LanguagePlan.chunks(try speech(samples, threads: params.threads))
+        let chunks = LanguagePlan.chunks(
+            try speech(samples, threads: params.threads, shouldAbort: callbacks.shouldAbort))
         var picked: [String] = []
         for (index, chunk) in chunks.enumerated() {
             if callbacks.shouldAbort() { throw .interrupted }
             callbacks.progress(index * 10 / chunks.count)
-            let probabilities = try languageProbabilities(slice(samples, chunk), threads: params.threads)
+            let probabilities = try languageProbabilities(
+                slice(samples, chunk), threads: params.threads, shouldAbort: callbacks.shouldAbort)
             picked.append(LanguagePlan.pick(probabilities, allowed: languages))
         }
         let runs = LanguagePlan.runs(chunks, languages: picked)
@@ -118,9 +90,82 @@ public final class WhisperEngine: SpeechEngine, @unchecked Sendable {
         return segments
     }
 
+    /// Отрезки речи VAD в мс. t0/t1 — сантисекунды, как у сегментов whisper_full.
+    private func speech(_ samples: [Float], threads: Int32, shouldAbort: @escaping @Sendable () -> Bool)
+        throws(EarmarkError) -> [SpeechSpan]
+    {
+        try vad(samples, threads: threads, shouldAbort: shouldAbort).map { span in
+            SpeechSpan(startMs: Int((span.t0 * 10).rounded()), endMs: Int((span.t1 * 10).rounded()))
+        }
+    }
+
+    /// Сэмплы отрезка в мс; границы VAD с паддингом могут чуть вылезать за канал — обрезаем.
+    private func slice(_ samples: [Float], _ span: SpeechSpan) -> ArraySlice<Float> {
+        let perMs = Int(WHISPER_SAMPLE_RATE) / 1000
+        let lower = min(max(0, span.startMs * perMs), samples.count)
+        let upper = min(max(lower, span.endMs * perMs), samples.count)
+        return samples[lower..<upper]
+    }
+
+    /// whisper_full в мс. t0/t1 — сантисекунды на исходной шкале (VAD уже пересчитан), отсюда ×10.
+    private func full(_ samples: ArraySlice<Float>, _ params: WhisperParams, _ callbacks: Callbacks)
+        throws(EarmarkError) -> [RawSegment]
+    {
+        try whisperFull(samples, params, callbacks).map { segment in
+            RawSegment(
+                startMs: Int(segment.t0) * 10, endMs: Int(segment.t1) * 10,
+                text: segment.text.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+    }
+}
+
+/// whisper.cpp внутри воркера `earmark transcribe --now`, никогда в app: ggml на любом assert
+/// делает abort(), а после whisper_free в процессе остаётся ~233 MB.
+///
+/// Один контекст на оба канала: модель грузится один раз.
+public final class WhisperEngine: SpeechEngine, WhisperPrimitives, @unchecked Sendable {
+    /// whisper_context нельзя трогать из двух потоков сразу (whisper.h). Transcriber и так ходит
+    /// по каналам последовательно; lock делает @unchecked Sendable честным.
+    private let lock = NSLock()
+    private let context: OpaquePointer
+    private let vadModelPath: String
+
+    /// Модель и VAD не загрузились — unavailable: виновата машина, а не запись (попытка не считается).
+    public init(modelPath: URL, vadModelPath: URL) throws(EarmarkError) {
+        guard FileManager.default.fileExists(atPath: vadModelPath.path) else {
+            throw .unavailable("VAD model not found: \(vadModelPath.path)")
+        }
+        Self.silenceLogsUnlessAsked()
+        var params = whisper_context_default_params()
+        params.use_gpu = true
+        params.flash_attn = true
+        guard let context = whisper_init_from_file_with_params(modelPath.path, params) else {
+            throw .unavailable("whisper.cpp failed to load the model \(modelPath.path)")
+        }
+        self.context = context
+        self.vadModelPath = vadModelPath.path
+    }
+
+    deinit { whisper_free(context) }
+
+    public func transcribe(
+        _ samples: [Float], params: WhisperParams, progress: @escaping @Sendable (Int) -> Void,
+        shouldAbort: @escaping @Sendable () -> Bool
+    ) async throws(EarmarkError) -> [RawSegment] {
+        guard !samples.isEmpty else { return [] }
+        let callbacks = Callbacks(progress: progress, shouldAbort: shouldAbort)
+        return try await DedicatedThread.run("whisper") { () throws(EarmarkError) -> [RawSegment] in
+            self.lock.lock()
+            defer { self.lock.unlock() }
+            return try self.decode(samples, params, callbacks)
+        }
+    }
+
     /// Отрезки речи отдельным VAD: тот же Silero с дефолтами, что whisper_full берёт внутри.
     /// VAD-контекст свой на вызов и освобождается на любом выходе.
-    private func speech(_ samples: [Float], threads: Int32) throws(EarmarkError) -> [SpeechSpan] {
+    func vad(_ samples: [Float], threads: Int32, shouldAbort _: @escaping @Sendable () -> Bool)
+        throws(EarmarkError) -> [RemoteVADSpan]
+    {
         var contextParams = whisper_vad_default_context_params()
         contextParams.n_threads = threads
         guard let vad = whisper_vad_init_from_file_with_params(vadModelPath, contextParams) else {
@@ -133,18 +178,17 @@ public final class WhisperEngine: SpeechEngine, @unchecked Sendable {
         }
         guard let found else { throw .operationFailed("whisper VAD failed to detect speech") }
         defer { whisper_vad_free_segments(found) }
-        // t0/t1 — сантисекунды, как у сегментов whisper_full.
         return (0..<whisper_vad_segments_n_segments(found)).map { index in
-            SpeechSpan(
-                startMs: Int((whisper_vad_segments_get_segment_t0(found, index) * 10).rounded()),
-                endMs: Int((whisper_vad_segments_get_segment_t1(found, index) * 10).rounded()))
+            RemoteVADSpan(
+                t0: whisper_vad_segments_get_segment_t0(found, index),
+                t1: whisper_vad_segments_get_segment_t1(found, index))
         }
     }
 
     /// Вероятности всех языков whisper для куска: тот же энкодер и шаг декодера, что у auto.
-    private func languageProbabilities(_ samples: ArraySlice<Float>, threads: Int32) throws(EarmarkError)
-        -> [String: Float]
-    {
+    func languageProbabilities(
+        _ samples: ArraySlice<Float>, threads: Int32, shouldAbort _: @escaping @Sendable () -> Bool
+    ) throws(EarmarkError) -> [String: Float] {
         guard !samples.isEmpty else { return [:] }
         let mel = samples.withUnsafeBufferPointer { pcm in
             whisper_pcm_to_mel(context, pcm.baseAddress, Int32(pcm.count), threads)
@@ -161,17 +205,9 @@ public final class WhisperEngine: SpeechEngine, @unchecked Sendable {
         return byCode
     }
 
-    /// Сэмплы отрезка в мс; границы VAD с паддингом могут чуть вылезать за канал — обрезаем.
-    private func slice(_ samples: [Float], _ span: SpeechSpan) -> ArraySlice<Float> {
-        let perMs = Int(WHISPER_SAMPLE_RATE) / 1000
-        let lower = min(max(0, span.startMs * perMs), samples.count)
-        let upper = min(max(lower, span.endMs * perMs), samples.count)
-        return samples[lower..<upper]
-    }
-
     /// Один whisper_full с эталонными параметрами; время сегментов — от начала samples.
-    private func full(_ samples: ArraySlice<Float>, _ params: WhisperParams, _ callbacks: Callbacks)
-        throws(EarmarkError) -> [RawSegment]
+    func whisperFull(_ samples: ArraySlice<Float>, _ params: WhisperParams, _ callbacks: Callbacks)
+        throws(EarmarkError) -> [RemoteSegment]
     {
         // C-колбэки не захватывают контекст: замыкания едут через user_data.
         let box = Unmanaged.passRetained(callbacks)
@@ -197,13 +233,11 @@ public final class WhisperEngine: SpeechEngine, @unchecked Sendable {
         }
         if callbacks.shouldAbort() { throw .interrupted }
         guard code == 0 else { throw .operationFailed("whisper_full returned \(code)") }
-        // t0/t1 — сантисекунды на исходной шкале (VAD уже пересчитан), отсюда ×10.
         return (0..<whisper_full_n_segments(context)).map { index in
-            RawSegment(
-                startMs: Int(whisper_full_get_segment_t0(context, index)) * 10,
-                endMs: Int(whisper_full_get_segment_t1(context, index)) * 10,
-                text: whisper_full_get_segment_text(context, index).map { String(cString: $0) }?
-                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
+            RemoteSegment(
+                t0: whisper_full_get_segment_t0(context, index),
+                t1: whisper_full_get_segment_t1(context, index),
+                text: whisper_full_get_segment_text(context, index).map { String(cString: $0) } ?? "")
         }
     }
 
@@ -215,7 +249,7 @@ public final class WhisperEngine: SpeechEngine, @unchecked Sendable {
     }
 }
 
-private final class Callbacks: Sendable {
+final class Callbacks: Sendable {
     let progress: @Sendable (Int) -> Void
     let shouldAbort: @Sendable () -> Bool
 

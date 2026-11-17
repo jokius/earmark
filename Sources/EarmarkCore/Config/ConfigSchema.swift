@@ -42,6 +42,13 @@ public enum ConfigSchema {
             "transcription.language", .string, .string("auto"),
             "Whisper language: auto, a code (ru) or a comma-separated list (ru,en,az) picked per speech fragment"
         ),
+        spec(
+            "transcription.remote.enabled", .bool, .bool(false),
+            "Transcribe on your own whisper server on the LAN instead of this Mac; "
+                + "falls back to local whisper when it is unavailable"),
+        spec(
+            "transcription.remote.url", .string, .string(""),
+            "Base URL of the whisper server, e.g. http://gpu-box.local:8178"),
         spec("transcript.label_me", .string, .string("Me"), "Speaker label for the microphone channel"),
         spec("transcript.label_them", .string, .string("Them"), "Speaker label for the system audio channel"),
     ]
@@ -152,6 +159,8 @@ public enum ConfigSchema {
             return language.raw
         }
         switch key {
+        case "transcription.remote.url":
+            return try remoteURL(text, key: key)
         case "transcript.label_me", "transcript.label_them":
             guard !text.isEmpty, !hasControl else {
                 throw .invalidValue(key: key, reason: "expected a non-empty single-line label")
@@ -167,6 +176,25 @@ public enum ConfigSchema {
             }
         }
         return text
+    }
+
+    /// "" — не задан. Иначе http(s) с хостом, без query, fragment и логина; хранится без хвостового "/":
+    /// "http://gpu-box.local:8178/" и "http://gpu-box.local:8178" — одно значение.
+    static func remoteURL(_ text: String, key: String) throws(ConfigError) -> String {
+        guard !text.isEmpty else { return text }
+        var canonical = text
+        while canonical.hasSuffix("/") { canonical.removeLast() }
+        guard let parts = URLComponents(string: canonical),
+            ["http", "https"].contains(parts.scheme?.lowercased()), parts.host?.isEmpty == false,
+            parts.query == nil, parts.fragment == nil, parts.user == nil, parts.password == nil
+        else {
+            throw .invalidValue(
+                key: key,
+                reason:
+                    "expected an http:// or https:// URL with a host and without a query, fragment or credentials, "
+                    + "e.g. http://gpu-box.local:8178")
+        }
+        return canonical
     }
 
     /// ~ раскрыт, путь абсолютный и нормализованный. Desktop, Documents и Downloads (и всё внутри)

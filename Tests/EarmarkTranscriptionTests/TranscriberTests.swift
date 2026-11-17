@@ -500,3 +500,74 @@ struct TranscriberTests {
         #expect(segments.allSatisfy { $0["language"] == nil })
     }
 }
+
+@Suite("Transcriber: удалённый whisper с фолбэком на локальный")
+struct TranscriberRemoteTests {
+    private let config = Config(values: ["transcription.language": .string("ru")])
+
+    /// Пути, где модели и VAD точно нет: локальный whisper отсюда не поднять.
+    private let missing = FileManager.default.temporaryDirectory.appending(
+        path: "earmark-no-model-\(UUID().uuidString)")
+
+    private func transcriber(_ fixture: RecordingFixture, remote: RemoteWhisperClient) -> Transcriber {
+        Transcriber(
+            store: fixture.store, modelPath: missing.appending(path: "ggml-large-v3-turbo.bin"),
+            vadModelPath: missing.appending(path: "ggml-silero-v5.1.2.bin"), config: config, remote: remote)
+    }
+
+    private func run(_ transcriber: Transcriber, _ fixture: RecordingFixture) async throws(EarmarkError)
+        -> Transcript
+    {
+        try await transcriber.run(
+            folder: fixture.folder, force: false, progress: { _ in /* прогресс здесь не проверяем */ },
+            shouldAbort: { false })
+    }
+
+    @Test("совместимый сервер: оба канала распознаны на нём, локальная модель не грузится, файлы как обычно")
+    func remoteTranscribes() async throws {
+        let fixture = try RecordingFixture()
+        let served = Mutex(0)
+        let server = try FakeWhisper.server(full: { _ in
+            let channel = served.withLock {
+                $0 += 1
+                return $0
+            }
+            return channel == 1
+                ? FakeWhisper.segments([(0, 90, " первый канал ")])
+                : FakeWhisper.segments([(100, 180, " второй канал")])
+        })
+        defer { server.stop() }
+
+        let transcript = try await run(transcriber(fixture, remote: FakeWhisper.client(server)), fixture)
+
+        #expect(transcript.segments.map(\.text).sorted() == ["второй канал", "первый канал"])
+        #expect(server.paths.first == "/v1/health")
+        let channels = server.requests("/v1/full")
+        #expect(channels.count == 2)
+        #expect(channels.allSatisfy { $0.query["language"] == "ru" })
+        // 2 с стерео 48 kHz → по 32 000 сэмплов 16 kHz на канал.
+        #expect(channels.allSatisfy { abs($0.body.count / 4 - 32_000) < 1_600 })
+        let meta = try fixture.meta
+        #expect(meta.status == .transcribed)
+        #expect(meta.transcription.fingerprint == Transcriber.fingerprint)
+        let mic = try EarmarkJSON.decoder.decode(
+            ChannelTranscript.self, from: Data(contentsOf: fixture.file(RecordingFiles.transcriptMic)))
+        #expect(mic.fingerprint == Transcriber.fingerprint)
+    }
+
+    @Test("сервер недоступен — фолбэк на локальный: без модели это unavailable (69), а не remote_failed")
+    func deadServerFallsBack() async throws {
+        let fixture = try RecordingFixture()
+        let remote = RemoteWhisperClient(baseURL: try FakeWhisper.deadURL(), token: FakeWhisper.token)
+
+        let error = await #expect(throws: EarmarkError.self) {
+            try await run(transcriber(fixture, remote: remote), fixture)
+        }
+
+        #expect(error?.code == "unavailable")
+        #expect(error?.exitCode == 69)
+        let meta = try fixture.meta
+        #expect(meta.transcription.attempts == 0)
+        #expect(meta.status == .recorded)
+    }
+}

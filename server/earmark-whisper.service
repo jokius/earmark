@@ -1,0 +1,12 @@
+# systemd user unit; deploy.sh installs it to ~/.config/systemd/user/ and enables lingering
+# so it starts at boot without a login session.
+[Unit]
+Description=earmark whisper server (whisper.cpp on CUDA)
+
+[Service]
+ExecStart=%h/earmark-server/bin/earmark-whisper-server --model %h/earmark-server/models/ggml-large-v3-turbo.bin --vad-model %h/earmark-server/models/ggml-silero-v5.1.2.bin --token-file %h/earmark-server/token
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

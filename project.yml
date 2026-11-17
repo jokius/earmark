@@ -85,6 +85,8 @@ targets:
           Earmark records the other side of a call from system audio.
         NSCalendarsFullAccessUsageDescription: >-
           Earmark reads the calendars you choose to start recording just before a meeting.
+        NSLocalNetworkUsageDescription: >-
+          Earmark sends recordings to the transcription server in your network when you turn that on.
     preBuildScripts:
       - name: SwiftLint
         basedOnDependencyAnalysis: false

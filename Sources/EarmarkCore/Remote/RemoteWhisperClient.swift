@@ -82,8 +82,17 @@ public struct RemoteWhisperClient: Sendable {
         self.timeouts = timeouts
     }
 
-    /// Без кэша и cookie; таймаут у каждого запроса свой.
-    private static let session = URLSession(configuration: .ephemeral)
+    /// Без кэша и cookie; таймаут у каждого запроса свой. Редиректы не выполняются: наш сервер их не шлёт,
+    /// а 307/308 переотправили бы Bearer и звук по чужому адресу. 3xx доходит до кода как не-200.
+    private static let session = URLSession(
+        configuration: .ephemeral, delegate: NoRedirects(), delegateQueue: nil)
+
+    private final class NoRedirects: NSObject, URLSessionTaskDelegate, Sendable {
+        func urlSession(
+            _ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+            newRequest request: URLRequest
+        ) async -> URLRequest? { nil }
+    }
 
     /// GET /v1/health?nonce=<свежие 32 случайных байта hex> без Authorization; proof сверяется (CryptoKit HMAC,
     /// за постоянное время). Нет proof / не совпал → remoteFailed с причиной "server did not prove it knows the

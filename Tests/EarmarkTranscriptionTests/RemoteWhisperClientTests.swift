@@ -306,6 +306,26 @@ struct RemoteWhisperClientContractTests {
 
 @Suite("RemoteWhisperClient: любой сбой сервера — remote_failed")
 struct RemoteWhisperClientFailureTests {
+    @Test("307 на другой адрес — remote_failed; ни Bearer, ни звук туда не уходят")
+    func redirectNotFollowed() async throws {
+        let elsewhere = try FakeWhisper.server()
+        defer { elsewhere.stop() }
+        let target = elsewhere.baseURL.absoluteString
+        let server = try FakeWhisperServer { request, connection in
+            connection.write(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: \(target)\(request.path)?threads=4\r\n"
+                    + "Content-Length: 0\r\nConnection: close\r\n\r\n")
+        }
+        defer { server.stop() }
+
+        let error = await #expect(throws: EarmarkError.self) {
+            try await FakeWhisper.client(server).vad([0.5, -0.5], threads: 4)
+        }
+
+        expectRemoteFailed(error, containing: "HTTP 307")
+        #expect(elsewhere.requests.isEmpty)
+    }
+
     @Test("последняя строка {\"error\":…} — remote_failed с текстом сервера")
     func errorLine() async throws {
         let server = try FakeWhisperServer { _, connection in

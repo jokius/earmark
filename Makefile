@@ -61,7 +61,7 @@ install: build
 	ln -sf "$(INSTALLED)/Contents/Helpers/earmark" "$(CLI_LINK)"
 	"$(CLI_LINK)" help > /dev/null && echo "CLI runs"
 	@echo "installed: $(INSTALLED), CLI: $(CLI_LINK)"
-	open "$(INSTALLED)"
+	open -g "$(INSTALLED)"  # -g: без фокуса, ставить можно посреди созвона
 
 # Symlink удаляем, только если он наш: чужой earmark в ~/.local/bin не трогаем.
 uninstall:

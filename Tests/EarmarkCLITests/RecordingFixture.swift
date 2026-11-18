@@ -1,0 +1,1 @@
+../EarmarkTranscriptionTests/RecordingFixture.swift

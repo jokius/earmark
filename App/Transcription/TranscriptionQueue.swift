@@ -4,7 +4,8 @@ import os
 
 /// Очередь транскрипции (§8.4): по одной задаче, старые первыми, каждая — отдельный процесс
 /// `earmark transcribe <id> --now`. В процессе app whisper не крутится никогда: ggml на любом
-/// assert делает abort(), а после whisper_free остаётся ~233 MB (§3.1).
+/// assert делает abort(), а после whisper_free остаётся ~233 MB (§3.1). В удалённом режиме воркер
+/// только отдаёт звук серверу и забирает результат, а локальная модель не нужна вовсе.
 ///
 /// Источник правды — папки записей и meta.json, а не память: после перезапуска очередь
 /// восстанавливается сканом `pendingTranscription()`. meta во всех случаях пишет сам воркер
@@ -18,6 +19,9 @@ final class TranscriptionQueue {
         /// meta до запуска — для revert, если воркер убит сигналом и не вернул её сам.
         let before: RecordingMeta
         let process: Process
+        /// Чтение вывода воркера: завершение разбираем только после него, иначе последняя строка — конверт
+        /// ошибки — могла бы прийти позже terminationHandler и потеряться.
+        let output: Task<Void, Never>
         /// Когда воркеру послан SIGTERM (вытеснение); nil — не вытеснялся.
         var preemptedAt: Date?
     }
@@ -36,6 +40,9 @@ final class TranscriptionQueue {
 
     private(set) var progress: TranscribeProgress?
     private(set) var pendingCount = 0
+    /// Воркер ждёт сервер расшифровки (недоступен или не настроен) или его не нашёл doctor
+    /// (remote_unreachable); снимается успешным прогоном, ответом сервера (remote_pending) или doctor.
+    var remoteUnreachable = false
     var runningID: String? { running?.id }
 
     private let store: () -> RecordingStore
@@ -59,6 +66,9 @@ final class TranscriptionQueue {
     /// Задачи, которые сейчас не надо трогать: lock занят чужим воркером, воркер упал.
     private var cooldown: [String: Date] = [:]
     private var lastWorkerError: String?
+    /// Сервер не ответил воркеру: бэклог ждёт паузу целиком, а не перебирает записи по одной, каждая
+    /// со своим таймаутом health. Явные запросы идут и в паузу.
+    private var remoteRetryAt = Date.distantPast
     private var ticker: Task<Void, Never>?
     private let logger = Logger(subsystem: EarmarkPaths.bundleID, category: "transcription")
 
@@ -169,7 +179,9 @@ final class TranscriptionQueue {
         // Нагрев (§8.4): при .serious и выше новые задачи не стартуют.
         let hot = ProcessInfo.processInfo.thermalState.rawValue >= ProcessInfo.ThermalState.serious.rawValue
         guard !blocked, !hot else { return }
-        if waitingForModel {
+        // Удалённый режим модель на маке не использует: её не ждём и не качаем.
+        let needsModel = !config().remoteTranscriptionEnabled
+        if waitingForModel && needsModel {
             // Работа могла исчезнуть (записи удалили): раз в минуту сверяемся, иначе после неудачной
             // загрузки 1.6 ГБ качались бы впустую — модель нужна, только когда есть что расшифровать (§8.2).
             if now >= nextScan, nextRequest(now: now) == nil {
@@ -182,7 +194,7 @@ final class TranscriptionQueue {
             waitingForModel = false
         }
         guard let next = nextRequest(now: now) else { return }
-        guard provisioner.isReady else {
+        guard !needsModel || provisioner.isReady else {
             // Пока модели нет, записи ждут в recorded и попыток не тратят (§8.2).
             waitingForModel = true
             return
@@ -196,7 +208,7 @@ final class TranscriptionQueue {
             needsScan = true
         }
         if let request = requests.first(where: { cooldown[$0.id] == nil }) { return request }
-        guard needsScan || now >= nextScan else { return nil }
+        guard now >= remoteRetryAt, needsScan || now >= nextScan else { return nil }
         nextScan = now.addingTimeInterval(Self.pause)
         let pending: [RecordingFolder]
         do {
@@ -245,7 +257,11 @@ final class TranscriptionQueue {
         process.terminationHandler = { [weak self] finished in
             let status = finished.terminationStatus
             let reason = finished.terminationReason
-            Task { @MainActor in self?.finished(id: id, status: status, reason: reason) }
+            Task { @MainActor in
+                // pipe закрывается со смертью воркера (Foundation закрывает наш конец записи после run).
+                await self?.running?.output.value
+                self?.finished(id: id, status: status, reason: reason)
+            }
         }
         do {
             try process.run()
@@ -255,18 +271,19 @@ final class TranscriptionQueue {
             return
         }
         requests.removeAll { $0.id == request.id }
-        running = Job(id: id, force: request.force, folder: folder.url, before: meta, process: process)
+        running = Job(
+            id: id, force: request.force, folder: folder.url, before: meta, process: process,
+            output: read(output.fileHandleForReading, id: id))
         progress = nil
         lastWorkerError = nil
         pendingCount = max(0, pendingCount - 1)
-        read(output.fileHandleForReading, id: id)
     }
 
     /// stdout и stderr воркера — один pipe: JSON-строки прогресса (TranscribeProgress), каждая одним
     /// write(2), и последней строкой конверт CLI (ошибка — из stderr); с EARMARK_WHISPER_LOG ещё лог
     /// whisper. Всё, что не прогресс, — кандидат в причину сбоя. Читаем до конца: непрочитанный pipe
     /// заполнился бы и остановил воркер.
-    private func read(_ output: FileHandle, id: String) {
+    private func read(_ output: FileHandle, id: String) -> Task<Void, Never> {
         Task { [weak self] in
             do {
                 for try await line in output.bytes.lines {
@@ -303,6 +320,7 @@ final class TranscriptionQueue {
         switch (reason, status) {
         case (.exit, 0):
             logger.notice("transcribed \(id, privacy: .public)")
+            remoteUnreachable = false
         case (.exit, 75):
             // Lock держит другой воркер (например, `earmark transcribe --now` руками) или воркер
             // прервали не мы (SIGINT, SIGHUP): meta он вернул сам. Явный --force, как при вытеснении,
@@ -310,10 +328,11 @@ final class TranscriptionQueue {
             cooldown[id] = later
             if job.force { requests.insert(Request(id: id, force: true), at: 0) }
         case (.exit, 69):
-            // Модели нет или не читается config.json — environmental, попытку воркер не засчитал
-            // (D36). Пауза — на случай, если файл есть, но не грузится: иначе запуск шёл бы каждую секунду.
+            // Модели нет, не читается config.json или сервер расшифровки недоступен, не настроен, ещё не
+            // досчитал — environmental, попытку воркер не засчитал (D36). Пауза — на случай, если файл есть,
+            // но не грузится: иначе запуск шёл бы каждую секунду.
             cooldown[id] = later
-            provisioner.refresh()
+            workerUnavailable(until: later)
         case (.exit, 65):
             // Битое аудио — permanent: обычно воркер уже записал transcription_failed (D36). Пауза
             // защитная (D37): отказ до захвата meta не трогает, и скан перезапускал бы задачу каждую секунду.
@@ -351,6 +370,40 @@ final class TranscriptionQueue {
         } catch {
             logger.error("cannot revert preempted job: \(error.localizedDescription, privacy: .public)")
         }
+    }
+
+    /// exit 69 в удалённом режиме: сервер недоступен (remote_failed) или не настроен — пауза всему бэклогу и
+    /// remote_unreachable до успешного прогона; сервер ответил, но результата ещё нет (remote_pending) —
+    /// флаг снимается, ждёт только эта запись. В локальном — нет ли модели.
+    private func workerUnavailable(until later: Date) {
+        guard config().remoteTranscriptionEnabled else {
+            provisioner.refresh()
+            return
+        }
+        guard let error = Self.workerError(lastWorkerError) else { return }
+        if error.code == "remote_pending" {
+            remoteUnreachable = false
+            return
+        }
+        guard
+            error.code == "remote_failed"
+                || error.code == "unavailable" && error.message.hasPrefix(RemoteTranscription.waitingPrefix)
+        else { return }
+        remoteUnreachable = true
+        remoteRetryAt = later
+    }
+
+    /// Ошибка из конверта CLI — последней строки воркера.
+    private static func workerError(_ line: String?) -> (code: String, message: String)? {
+        struct Envelope: Decodable {
+            struct Failure: Decodable {
+                let code: String
+                let message: String
+            }
+            let error: Failure
+        }
+        return line.flatMap { try? JSONDecoder().decode(Envelope.self, from: Data($0.utf8)) }
+            .map { ($0.error.code, $0.error.message) }
     }
 
     private static func queued(position: Int) -> JSONValue {

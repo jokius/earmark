@@ -20,40 +20,34 @@ public struct Transcriber: Sendable {
     private let store: RecordingStore
     private let config: Config
     private let makeEngine: EngineFactory
+    /// Сервер расшифровки (RemoteTranscriber.swift): каналы считает он, makeEngine не зовётся никогда.
+    private let remote: (server: RemoteTranscriptionClient, wait: RemoteWait)?
 
-    /// remote — сервер whisper в LAN: каналы идут туда, а при любом его сбое — локально (модель
-    /// тогда грузится только при первом фолбэке).
-    public init(
-        store: RecordingStore, modelPath: URL, vadModelPath: URL, config: Config,
-        remote: RemoteWhisperClient? = nil
-    ) {
-        let local: EngineFactory = { () async throws(EarmarkError) -> any SpeechEngine in
+    public init(store: RecordingStore, modelPath: URL, vadModelPath: URL, config: Config) {
+        self.init(store: store, config: config) { () async throws(EarmarkError) -> any SpeechEngine in
             // Загрузка модели блокирует 1–2 с, а первый запуск нового бинаря ещё ~20 с компилирует
             // шейдеры Metal — не в кооперативном пуле.
             try await DedicatedThread.run("whisper load") { () throws(EarmarkError) -> WhisperEngine in
                 try WhisperEngine(modelPath: modelPath, vadModelPath: vadModelPath)
             }
         }
-        guard let remote else {
-            self.init(store: store, config: config, makeEngine: local)
-            return
-        }
-        self.init(store: store, config: config) {
-            FallbackSpeechEngine(remote: RemoteWhisperEngine(client: remote), local: local)
-        }
     }
 
-    init(store: RecordingStore, config: Config, makeEngine: @escaping EngineFactory) {
+    init(
+        store: RecordingStore, config: Config, makeEngine: @escaping EngineFactory,
+        remote: (server: RemoteTranscriptionClient, wait: RemoteWait)? = nil
+    ) {
         self.store = store
         self.config = config
         self.makeEngine = makeEngine
+        self.remote = remote
     }
 
     /// Lock → meta(transcribing, attempts++) → каналы → PostFilter → merge → transcript.json/txt
     /// → meta(transcribed).
     ///
-    /// Ошибки: busy — lock у другого процесса (meta не тронута); unavailable — нет модели/VAD
-    /// (попытка возвращается); interrupted — SIGTERM или вытеснение (попытка возвращается);
+    /// Ошибки: busy — lock у другого процесса (meta не тронута); unavailable — нет модели/VAD или сервер
+    /// расшифровки недоступен (попытка возвращается, в meta — "waiting for server: …"); interrupted — SIGTERM или вытеснение (попытка возвращается);
     /// bad_data — аудио не читается (сразу transcription_failed); остальное — operation_failed
     /// (transcription_failed после maxAttempts засчитанных неудач, раньше — обратно в recorded).
     public func run(
@@ -64,14 +58,26 @@ public struct Transcriber: Sendable {
             throw .busy("another process is already transcribing this recording")
         }
         defer { lock.release() }
-        let before = try claim(folder, force: force)
+        // Удалённый fingerprint известен только из ответа сервера: в meta он попадает с результатом.
+        let before = try claim(folder, force: force, fingerprint: remote == nil ? Self.fingerprint : nil)
         let language = self.language(of: before)
         do throws(EarmarkError) {
-            let channels = try await transcribeChannels(
-                folder, force: force, language: language, progress: progress, shouldAbort: shouldAbort)
+            let channels: (mic: ChannelTranscript, system: ChannelTranscript)
+            // Задача на сервере, которую после результата удалить: готовые файлы каналов её не трогают.
+            var serverJob = false
+            if let remote {
+                let result = try await RemoteAttempt(
+                    id: before.id, language: language, server: remote.server, shouldAbort: shouldAbort
+                ).transcribe(folder, meta: before, force: force, wait: remote.wait, progress: progress)
+                channels = result.channels
+                serverJob = !result.reused
+            } else {
+                channels = try await transcribeChannels(
+                    folder, force: force, language: language, progress: progress, shouldAbort: shouldAbort)
+            }
             if shouldAbort() { throw .interrupted }
             let transcript = Transcript(
-                recordingId: before.id, model: Models.largeV3Turbo.name, language: language,
+                recordingId: before.id, model: channels.mic.model, language: language,
                 segments: TranscriptMerge.merge(mic: channels.mic, system: channels.system))
             try publish(transcript, in: folder)
             try update(folder) { meta in
@@ -79,7 +85,10 @@ public struct Transcriber: Sendable {
                 meta.transcription.attempts = 0
                 meta.transcription.error = nil
                 meta.transcription.errorKind = nil
+                meta.transcription.fingerprint = channels.mic.fingerprint
             }
+            // Результат уже на диске: задача на сервере больше не нужна, её сбой успех не отменяет.
+            if let remote, serverJob { try? await remote.server.delete(before.id) }
             return transcript
         } catch {
             // Отмену и настоящую ошибку разом отдаём как отмену: незасчитанная попытка и exit 75
@@ -102,7 +111,9 @@ public struct Transcriber: Sendable {
 
     /// Захват задачи: attempts++ сразу, так крэш посреди работы засчитается без лишнего кода.
     /// Возвращает meta до захвата: незасчитанная попытка возвращает из неё статус и блок transcription.
-    private func claim(_ folder: URL, force: Bool) throws(EarmarkError) -> RecordingMeta {
+    /// fingerprint nil — не трогать (удалённый путь узнаёт его только из ответа сервера).
+    private func claim(_ folder: URL, force: Bool, fingerprint: String?) throws(EarmarkError) -> RecordingMeta
+    {
         guard let meta = try readMeta(folder) else {
             throw .notFound("\(folder.lastPathComponent) has no meta.json: the recording is not finished")
         }
@@ -127,7 +138,7 @@ public struct Transcriber: Sendable {
             }
             meta.status = .transcribing
             meta.transcription.attempts += 1
-            meta.transcription.fingerprint = Self.fingerprint
+            if let fingerprint { meta.transcription.fingerprint = fingerprint }
             meta.transcription.language = language(of: meta)
         }
         return meta
@@ -138,10 +149,8 @@ public struct Transcriber: Sendable {
         config.transcriptionLanguage(forCalendar: meta.calendar?.id)
     }
 
-    /// Каналы по очереди: 0 — mic, 1 — system. Готовый канал с тем же fingerprint и языком записи не
-    /// пересчитываем (воркер мог упасть на втором канале). Язык в fingerprint не входит (D4), поэтому
-    /// сверяем его отдельно: иначе после смены языка в конфиге старый канал выдавался бы за новый язык.
-    /// Модель грузим, только если хоть один канал нужно
+    /// Каналы по очереди: 0 — mic, 1 — system. Готовый канал (reusable) не пересчитываем (воркер мог
+    /// упасть на втором канале). Модель грузим, только если хоть один канал нужно
     /// считать, и отпускаем вместе с этой функцией — до слияния.
     private func transcribeChannels(
         _ folder: URL, force: Bool, language: String,
@@ -153,9 +162,7 @@ public struct Transcriber: Sendable {
         for (index, channel) in [Channel.mic, .system].enumerated() {
             let url = folder.appending(
                 path: channel == .mic ? RecordingFiles.transcriptMic : RecordingFiles.transcriptSystem)
-            if !force, let existing = try? Self.decode(ChannelTranscript.self, at: url),
-                existing.fingerprint == Self.fingerprint, existing.language == language
-            {
+            if !force, let existing = Self.reusable(url, fingerprint: Self.fingerprint, language: language) {
                 done[channel] = existing
                 continue
             }
@@ -187,6 +194,16 @@ public struct Transcriber: Sendable {
             throw .operationFailed("transcript channels are missing")
         }
         return (mic, system)
+    }
+
+    /// Готовый файл канала, который не пересчитываем: тот же fingerprint и язык записи. Язык в fingerprint
+    /// не входит (D4), поэтому сверяем его отдельно: иначе после смены языка в конфиге старый канал
+    /// выдавался бы за новый язык.
+    static func reusable(_ url: URL, fingerprint: String, language: String) -> ChannelTranscript? {
+        guard let existing = try? decode(ChannelTranscript.self, at: url),
+            existing.fingerprint == fingerprint, existing.language == language
+        else { return nil }
+        return existing
     }
 
     /// txt раньше json: потребители считают появление transcript.json сигналом «готово» (§7.3),
@@ -229,12 +246,21 @@ public struct Transcriber: Sendable {
 
     /// Любая ошибка декода — EarmarkAudioError или NSError от AVAudioFile — значит битое аудио: bad_data.
     /// Текст — localizedDescription: у EarmarkAudioError английский errorDescription (Task 9, D21).
-    private static func extract(_ audio: URL, channel: Int) throws(EarmarkError) -> [Float] {
+    static func extract(_ audio: URL, channel: Int) throws(EarmarkError) -> [Float] {
         do {
             return try ChannelExtractor.extract(from: audio, channel: channel)
         } catch {
             let reason = error.localizedDescription
             throw .badData("\(audio.lastPathComponent) is unreadable (channel \(channel)): \(reason)")
+        }
+    }
+
+    /// Длина канала (16 kHz) по заголовку файла, без декода; ошибка — битое аудио, как у extract.
+    static func length(_ audio: URL) throws(EarmarkError) -> Int {
+        do {
+            return try ChannelExtractor.length(of: audio)
+        } catch {
+            throw .badData("\(audio.lastPathComponent) is unreadable: \(error.localizedDescription)")
         }
     }
 
@@ -259,7 +285,7 @@ public struct Transcriber: Sendable {
         try EarmarkJSON.decoder.decode(T.self, from: Data(contentsOf: url))
     }
 
-    private static func writeJSON<T: Encodable>(_ value: T, to url: URL) throws(EarmarkError) {
+    static func writeJSON<T: Encodable>(_ value: T, to url: URL) throws(EarmarkError) {
         let data: Data
         do {
             data = try EarmarkJSON.encoder.encode(value)

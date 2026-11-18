@@ -53,9 +53,10 @@ public enum Registry {
     }
 
     /// `transcribe <id>` ставит запись в очередь app; с `--now` работа идёт в этом процессе —
-    /// так app запускает воркер транскрипции, и app для этого не нужен.
+    /// так app запускает воркер транскрипции, и app для этого не нужен. `--local` (whisper на этом
+    /// маке) — тоже только в этом процессе: очередь app в удалённом режиме локально не расшифровывает.
     static let transcribe: CommandHandler = { parsed, context in
-        if parsed.flag("now") {
+        if parsed.flag("now") || parsed.flag("local") {
             return try await transcribeNow(parsed, context)
         }
         return try await AppCommands.enqueueTranscription(parsed, context)

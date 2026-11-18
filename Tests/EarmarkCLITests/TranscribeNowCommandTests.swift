@@ -34,6 +34,13 @@ struct TranscribeNowCommandTests {
         #expect(cmd.options["now"] == "true" && cmd.options["force"] == "true")
     }
 
+    @Test("таблица команд разбирает transcribe <id> --now --local")
+    func parseLocal() throws {
+        let cmd = try CommandTable.parse(["transcribe", "20261002-1400-a1b2", "--now", "--local"])
+        #expect(cmd.path == ["transcribe"])
+        #expect(cmd.options["now"] == "true" && cmd.options["local"] == "true")
+    }
+
     @Test("нет модели — unavailable (69), meta не тронута: попытка не потрачена")
     func modelMissing() throws {
         let (config, folder) = try recordings()

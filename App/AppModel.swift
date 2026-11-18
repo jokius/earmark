@@ -164,6 +164,7 @@ final class AppModel {
         session.onDiscarded = { [weak self, weak scheduler] id, reason in
             scheduler?.recordingDiscarded(id: id, reason: reason)
             self?.recordingGone(id)
+            self?.deleteRemoteJob(id)
         }
         session.onFinalizeFailed = { [weak self] id in self?.recordingGone(id) }
         // Восстановленные при старте записи уходят в очередь, как только сведены (§4.3, D33).
@@ -231,10 +232,16 @@ final class AppModel {
                 channel: queue.progress?.channel.rawValue, percent: queue.progress?.percent)
             if data.state == "idle" && queue.runningID != nil { data.state = "transcribing" }
         }
-        if let error = provisioner.lastError {
+        // В удалённом режиме модель на маке не нужна и сама не качается: model_missing был бы вечным, а
+        // model_download_failed — старым сбоем из локального режима.
+        let remote = config.remoteTranscriptionEnabled
+        if !remote, let error = provisioner.lastError {
             data.warnings.append("model_download_failed: \(error)")
-        } else if config.transcriptionEnabled && provisioner.info.state == "missing" {
+        } else if !remote && config.transcriptionEnabled && provisioner.info.state == "missing" {
             data.warnings.append("model_missing")
+        }
+        if remote && config.transcriptionEnabled && queue?.remoteUnreachable == true {
+            data.warnings.append("remote_unreachable")
         }
         return data
     }
@@ -439,6 +446,9 @@ final class AppModel {
         merging.subtract([id, target])
         switch result {
         case .success(let folder):
+            // id исчезла: её задача на сервере расшифровки больше не нужна. Задача target сама
+            // пересоздастся, когда воркер увидит другие длины каналов.
+            deleteRemoteJob(id)
             // Вопрос, предлагавший приклеиться к id, теперь клеит к target: id в нём растворилась.
             // Вопрос самой target остаётся: на него ещё не ответили.
             for index in projectQuestions.indices where projectQuestions[index].mergeTarget?.id == id {
@@ -457,6 +467,25 @@ final class AppModel {
             queue?.requestScan()
         }
         applyProjectAnswers()
+    }
+
+    /// Задача записи на сервере расшифровки больше не нужна (склейка, отброшенная запись). Best effort:
+    /// сначала proof — токен не уходит чужому серверу; сбой — в лог, сервер сам удалит задачу через 7 дней.
+    private func deleteRemoteJob(_ id: String) {
+        guard
+            case .success(let client)? = RemoteTranscription.client(
+                config: config, supportDir: EarmarkPaths.supportDir)
+        else { return }
+        let logger = logger
+        Task.detached(priority: .utility) {
+            do throws(EarmarkError) {
+                _ = try await client.checkCompatible()
+                try await client.delete(id)
+            } catch {
+                logger.error(
+                    "remote job \(id, privacy: .public) is not deleted: \(error.message, privacy: .public)")
+            }
+        }
     }
 
     /// Любой ответ снимает вопрос: панель закрывается (и та, что открыта, когда ответили из CLI),
@@ -635,7 +664,11 @@ final class AppModel {
                     ? "\(config.calendars.count) enabled"
                     : "missing in EventKit: " + stale.joined(separator: ", ")))
         checks.append(recordingsDirCheck())
-        checks.append(await modelCheck())
+        var model = await modelCheck()
+        if config.remoteTranscriptionEnabled && !model.ok {
+            model.detail += "; needed only for earmark transcribe --local, recordings go to the server"
+        }
+        checks.append(model)
         checks.append(vadCheck())
         let cli = Self.cliExecutable?.path
         checks.append(
@@ -651,28 +684,40 @@ final class AppModel {
                 checks.append(DoctorCheck(name: "audio_test", ok: false, detail: error.message))
             }
         }
-        // Удалённое распознавание на ready не влияет: при любом его сбое воркер распознаёт локально.
+        // Удалённое распознавание на ready не влияет: выключенный сервер — ожидание, а не поломка установки.
+        // В удалённом режиме и локальная модель только для сведения: нужна лишь для --local.
+        let informational = [Self.remoteCheckName] + (config.remoteTranscriptionEnabled ? ["model"] : [])
         return DoctorReport(
-            ready: checks.allSatisfy { $0.ok || $0.name == Self.remoteCheckName }, checks: checks)
+            ready: checks.allSatisfy { $0.ok || informational.contains($0.name) }, checks: checks)
     }
 
     private static let remoteCheckName = "remote_transcription"
 
     /// Только при включённом transcription.remote.enabled: настроен ли, отвечает ли сервер, подошёл ли
-    /// токен и те же ли у него whisper.cpp и модели. nil — режим выключен, чека нет.
+    /// токен и те же ли у него whisper.cpp и VAD. nil — режим выключен, чека нет.
     private func remoteCheck() async -> DoctorCheck? {
         guard let setup = RemoteTranscription.client(config: config, supportDir: EarmarkPaths.supportDir)
         else { return nil }
-        let fallback = "; recordings are transcribed locally"
-        do {
-            let client = try setup.get()
+        let waiting = "; recordings wait for the server"
+        let client: RemoteTranscriptionClient
+        switch setup {
+        case .success(let configured):
+            client = configured
+        case .failure(let error):
+            queue?.remoteUnreachable = true
+            return DoctorCheck(name: Self.remoteCheckName, ok: false, detail: error.message + waiting)
+        }
+        // Результат proof видит и status (remote_unreachable): последняя проверка — воркера или эта.
+        do throws(EarmarkError) {
             let health = try await client.checkCompatible()
+            queue?.remoteUnreachable = false
             let gpu = health.gpu.isEmpty ? "" : " on \(health.gpu)"
             return DoctorCheck(
                 name: Self.remoteCheckName, ok: true,
-                detail: "\(client.baseURL.absoluteString): whisper \(health.whisper)\(gpu)")
+                detail: "\(client.baseURL.absoluteString): whisper \(health.whisper), \(health.model)\(gpu)")
         } catch {
-            return DoctorCheck(name: Self.remoteCheckName, ok: false, detail: error.message + fallback)
+            queue?.remoteUnreachable = true
+            return DoctorCheck(name: Self.remoteCheckName, ok: false, detail: error.message + waiting)
         }
     }
 

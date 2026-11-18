@@ -29,9 +29,9 @@ everything else is driven by the `earmark` command line, by you or by your codin
   app mid-recording works the same way: the next launch finishes the recording.
 - **One folder per calendar**: `~/Earmark/<Calendar>/2026-10-02 14-00 Daily sync/`.
 - **Local transcription** with whisper.cpp and large-v3-turbo (beam search, voice activity
-  detection), in a separate process after the call. Optionally on
+  detection), in a separate process after the call. Optionally all of it moves to
   [your own NVIDIA GPU server](#transcribing-on-another-machine) in the same network, with the
-  same whisper.cpp, model and parameters; when it is unreachable, the Mac transcribes as usual.
+  same whisper.cpp and parameters; while it is unreachable, recordings wait for it.
 - **CLI for everything** — settings, status, recordings, transcripts — with JSON output, plus a
   skill for Claude Code and an MCP server for Codex and other MCP clients.
 
@@ -164,6 +164,7 @@ to stderr as `{"schema_version":1,"error":{"code":"…","message":"…","exit_co
 | `earmark transcript <id> [--offset N] [--words N] [--format txt\|json]` | Transcript in pages of 200 words (500 at most) with `next_offset`; `json` returns all segments at once |
 | `earmark transcribe <id> [--force]` | Queue a recording for transcription in the app. `--force` redoes a transcribed or failed one |
 | `earmark transcribe <id> --now [--force]` | Transcribe in this process — this is how the app runs its worker |
+| `earmark transcribe <id> --local [--force]` | Transcribe with whisper on this Mac in this process, even when the [server mode](#transcribing-on-another-machine) is on; the recording's job on the server is deleted |
 | `earmark model status`, `earmark model download`, `earmark model import <path>` | The Whisper model |
 | `earmark config list`, `earmark config get <key>` | Settings, read from disk |
 | `earmark config set <key> <value>`, `earmark config reset <key>`, `earmark config reset --all` | Change settings through the app: validated and applied at once |
@@ -206,7 +207,7 @@ while the app is running take effect only after a restart.
 | `audio.keep_raw_tracks` | bool | `false` | Keep `mic.caf` and `system.caf` after muxing |
 | `transcription.enabled` | bool | `true` | Transcribe after each recording |
 | `transcription.language` | string | `auto` | `auto`, a Whisper language code (`ru`) or a comma-separated list (`ru,en,az`) picked per speech fragment |
-| `transcription.remote.enabled` | bool | `false` | Transcribe on your own whisper server in the network instead of this Mac, with a local fallback. See [Transcribing on another machine](#transcribing-on-another-machine) |
+| `transcription.remote.enabled` | bool | `false` | Transcribe on your own whisper server in the network instead of this Mac; while it is unreachable, recordings wait for it. See [Transcribing on another machine](#transcribing-on-another-machine) |
 | `transcription.remote.url` | string | — | Base URL of that server, e.g. `http://gpu-box.local:8178` |
 | `transcript.label_me` | string | `Me` | My label in `transcript.txt` |
 | `transcript.label_them` | string | `Them` | Their label in `transcript.txt` |
@@ -220,27 +221,43 @@ path, or the app will not open its socket.
 ## Transcribing on another machine
 
 Optional and off by default. If you have a Linux box (or Windows with WSL2) with an NVIDIA GPU in
-the same network, earmark can send the transcription work there. Recording, the queue, files and
-the Settings window stay on the Mac; only the whisper.cpp calls move.
+the same network, earmark can hand all transcription to it. Recording, the queue, files and the
+Settings window stay on the Mac; whisper runs only on the server.
 
-- **Same result as on the Mac.** The server is a thin wrapper in [`server/`](server/) around the
-  same whisper.cpp commit as the app (v1.9.4), with the same model file, the same parameters and
-  the same per-fragment language detection; the language logic itself still runs on the Mac. Before
-  sending any audio the Mac checks the server's whisper.cpp commit and the sha256 of both models and
-  refuses a server that differs. GPU arithmetic differs between CUDA and Metal, so a rare hard
-  fragment may still come out slightly differently.
-- **Falls back to the Mac.** Server off, unreachable (the laptop is away from home), wrong token,
-  an error, or no progress for too long — the same recording is transcribed locally, nothing is
-  lost or stuck. A one-hour call is one long streamed request with a heartbeat, so it does not hit
-  an HTTP timeout.
+- **Same result as on the Mac.** The server in [`server/`](server/) runs the same whisper.cpp
+  commit as the app (v1.9.4) with the same parameters and the same per-fragment language detection.
+  Before sending any audio the Mac checks the server's whisper.cpp commit and the sha256 of its
+  voice activity model and refuses a server that differs. The server picks the model; its name and
+  sha256 go into the transcript's `model` and fingerprint. GPU arithmetic differs between CUDA and
+  Metal, so a rare hard fragment may still come out slightly differently.
+- **Recordings wait for the server; the Mac never falls back.** Server off or unreachable (the
+  laptop is away from home), a token the server rejects, a server that fails the token check — the
+  recording keeps its status (`recorded`) with `transcription.error` starting with
+  `waiting for server:`, `earmark status` warns `remote_unreachable`, and the queue tries again
+  every minute. Nothing is lost and no attempt is used up. If the mode is not set up (no URL, no
+  token file, an empty one or one not chmod 600), recordings are not touched at all: they stay as
+  they are, `earmark status` warns `remote_unreachable` all the same, and `earmark doctor` names
+  what is missing. Nothing is transcribed on the Mac unless you ask for it:
+  `earmark transcribe <id> --local`. The local model is not needed in this mode; `earmark doctor`
+  lists it for information only.
+- **The server finishes on its own.** The Mac uploads both channels as a job and submits it, then
+  waits up to 30 seconds for the result; a longer job is picked up on a later try, which only asks
+  the server and does not decode the recording again. If the Mac sleeps or leaves right after the
+  call, the server still transcribes it, and the Mac fetches the text when it is back. A failure on
+  the server counts as a failed attempt, like a crash of local whisper: the next try submits the job
+  again, and that try counts too, even if the server goes down before it finishes. After 3 failed
+  attempts the recording is `transcription_failed`; `earmark transcribe <id> --force` starts over.
 - **What goes over the network**: the decoded audio of each channel (16 kHz PCM) and the resulting
   text, over plain HTTP. Before it sends the token or any audio, the Mac makes the server prove it
   holds the shared token (an HMAC of a fresh random challenge), so a device that merely answers to
-  the same name or address in another network, say in a hotel, gets neither, and the recording is
-  transcribed locally. The check runs once per recording, so switching networks in the middle of
-  a transcription is not covered. The traffic itself, the token included, is not encrypted, so
-  anyone who can watch your home network can read it: use the mode only in a network you trust. The server keeps no audio or text
-  on disk; its log has only per-request metadata (client address, audio length, language, time).
+  the same name or address in another network, say in a hotel, gets neither, and the recording
+  waits. The check runs once per try, so switching networks in the middle of an upload is not
+  covered. The traffic itself, the token included, is not encrypted, so anyone who can watch your
+  home network can read it: use the mode only in a network you trust.
+- **What stays on the server**: the audio and the transcript of a job, on disk, until the Mac has
+  picked up the result (then the job is deleted), and for 7 days at most. Its log has only
+  metadata: requests (client address, path with the recording id, status, time) and jobs
+  (languages, audio length, segment count), never text.
 
 Setup, from this repository on the Mac (needs ssh access to the server; it installs the CUDA toolkit
 if it is missing, copies the model and builds the server there):
@@ -249,12 +266,14 @@ if it is missing, copies the model and builds the server there):
 server/deploy.sh <ssh-host> gpu-box.local       # build, install as a systemd --user service, start
 earmark config set transcription.remote.url http://gpu-box.local:8178
 earmark config set transcription.remote.enabled true
-earmark doctor                                   # remote_transcription: whisper 1.9.4 on <GPU>
+earmark doctor                                   # remote_transcription: whisper 1.9.4, <model> on <GPU>
 ```
 
 The token is generated by `deploy.sh` and stored in
 `~/Library/Application Support/earmark/remote-token` (mode 0600) on the Mac and next to the server.
 The same switch and URL are in Settings, which also shows whether the server answers.
+`earmark transcribe <id> --local` transcribes one recording on the Mac anyway; it needs the local
+model (`earmark model download`).
 
 ## Agents
 
@@ -298,7 +317,8 @@ indicator.
 By default everything stays on your Mac. Recordings live in `~/Earmark` (mode 0700) and are never
 uploaded; transcription runs locally. The one exception is opt-in: with
 `transcription.remote.enabled` the audio of each recording is sent over your local network to the
-transcription server you set up yourself, and only after that server proves it holds your token (see
+transcription server you set up yourself, and only after that server proves it holds your token. The
+server keeps it until the Mac picks up the transcript, 7 days at most (see
 [Transcribing on another machine](#transcribing-on-another-machine)). The system audio channel
 captures everything your Mac plays except earmark itself — notification sounds and music included.
 

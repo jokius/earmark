@@ -49,6 +49,7 @@ struct MCPToolTableTests {
             #expect(Set(properties.keys) == ["id", "calendar", "manual"])
         }
         #expect(byName["transcribe_recording"]?["inputSchema"]?["properties"]?["now"] == nil)
+        #expect(byName["transcribe_recording"]?["inputSchema"]?["properties"]?["local"] == nil)
         #expect(byName["doctor"]?["inputSchema"]?["properties"]?["audio_test"]?["type"] == "boolean")
         #expect(byName["get_config"]?["inputSchema"]?["required"] == nil)
     }
@@ -133,6 +134,7 @@ struct MCPToolTableTests {
             ("get_recording", [:]),
             ("list_recordings", ["bogus": 1]),
             ("transcribe_recording", ["id": "x", "now": true]),
+            ("transcribe_recording", ["id": "x", "local": true]),
             ("get_status", "not an object"),
             ("set_config", ["key": ["nested"], "value": "1"]),
         ] as [(String, JSONValue)])

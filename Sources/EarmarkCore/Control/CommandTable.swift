@@ -115,6 +115,9 @@ public enum CommandTable {
             options: [
                 flag("--force", "Transcribe again even if transcripts exist"),
                 flag("--now", "Transcribe in this process, not in the app queue (the app's worker mode)"),
+                flag(
+                    "--local",
+                    "Transcribe with whisper on this Mac in this process, even when the server mode is on"),
             ],
             needsApp: true, mcpTool: "transcribe_recording", readOnly: false),
         CommandSpec(
@@ -308,8 +311,8 @@ public enum CommandTable {
     // MARK: - MCP
 
     /// Опции, которых нет в MCP: агент ставит транскрипцию только в очередь app,
-    /// а транскрипция в своём процессе — режим воркера самого app.
-    static let mcpHiddenOptions: Set<String> = ["--now"]
+    /// а транскрипция в своём процессе — режим воркера самого app (и `--local` — тоже в своём процессе).
+    static let mcpHiddenOptions: Set<String> = ["--now", "--local"]
 
     /// name, description, inputSchema, annotations. Порядок детерминирован (как в таблице):
     /// клиенты кэшируют список, а модели — промпт.

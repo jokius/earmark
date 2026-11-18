@@ -1,4 +1,3 @@
-import AVFoundation
 import EarmarkCore
 import Foundation
 import Synchronization
@@ -35,74 +34,6 @@ private final class Counter: Sendable {
     private let value = Mutex(0)
     func increment() { value.withLock { $0 += 1 } }
     var total: Int { value.withLock { $0 } }
-}
-
-/// Папка записи в свежем temp-каталоге: meta.json (recorded) + настоящий стерео AAC audio.m4a.
-private struct RecordingFixture {
-    let root: URL
-    let folder: URL
-    var store: RecordingStore { RecordingStore(root: root) }
-
-    /// calendarId: запись по событию этого календаря (meta.calendar); nil — ручная запись.
-    init(
-        status: String = "recorded", attempts: Int = 0, seconds: Double = 2, calendarId: String? = nil,
-        left: (Int) -> Float = { _ in 0 }, right: (Int) -> Float = { _ in 0 }
-    )
-        throws
-    {
-        root = FileManager.default.temporaryDirectory.appending(path: "earmark-tr-\(UUID().uuidString)")
-        folder = root.appending(path: "Manual/2026-10-02 14-00 Test")
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        // Календарная запись в meta — как в примере спеки §7.2: trigger, calendar и event.
-        let trigger =
-            calendarId.map {
-                #""trigger":"calendar","calendar":{"id":"\#($0)","title":"Calls"},"#
-                    + #""event":{"id":"evt-1","external_id":"ext-1","start":"2026-10-02T10:00:00Z","#
-                    + #""end":"2026-10-02T10:30:00Z"},"#
-            } ?? #""trigger":"manual","#
-        // meta пишем JSON-литералом: так фикстура не зависит от инициализаторов RecordingMeta.
-        let meta = """
-            {"schema_version":1,"id":"20261002-1400-a1b2","status":"\(status)",\(trigger)\
-            "title":"Test","started_at":"2026-10-02T10:00:00Z","duration_sec":\(seconds),"call_apps":[],\
-            "recovered":false,"transcription":{"attempts":\(attempts)},"app_version":"0.1.0"}
-            """
-        try Data(meta.utf8).write(to: folder.appending(path: RecordingFiles.meta))
-        try Self.writeStereoM4A(
-            folder.appending(path: RecordingFiles.audio), seconds: seconds, left: left, right: right)
-    }
-
-    var meta: RecordingMeta { get throws { try #require(try store.readMeta(in: folder)) } }
-
-    func file(_ name: String) -> URL { folder.appending(path: name) }
-
-    static func writeStereoM4A(_ url: URL, seconds: Double, left: (Int) -> Float, right: (Int) -> Float)
-        throws
-    {
-        let rate = 48_000.0
-        let format = try #require(
-            AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: rate, channels: 2, interleaved: false))
-        let file = try AVAudioFile(
-            forWriting: url,
-            settings: [
-                AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: rate, AVNumberOfChannelsKey: 2,
-                AVEncoderBitRateKey: 96_000,
-            ], commonFormat: .pcmFormatFloat32, interleaved: false)
-        let total = Int(seconds * rate)
-        let buffer = try #require(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 48_000))
-        let channels = try #require(buffer.floatChannelData)
-        var written = 0
-        while written < total {
-            let count = min(48_000, total - written)
-            buffer.frameLength = AVAudioFrameCount(count)
-            for frame in 0..<count {
-                channels[0][frame] = left(written + frame)
-                channels[1][frame] = right(written + frame)
-            }
-            try file.write(from: buffer)
-            written += count
-        }
-        file.close()
-    }
 }
 
 @Suite("Transcriber: задача транскрипции")
@@ -498,76 +429,5 @@ struct TranscriberTests {
         let segments = try #require(system["segments"] as? [[String: Any]])
         #expect(segments.count == 1)
         #expect(segments.allSatisfy { $0["language"] == nil })
-    }
-}
-
-@Suite("Transcriber: удалённый whisper с фолбэком на локальный")
-struct TranscriberRemoteTests {
-    private let config = Config(values: ["transcription.language": .string("ru")])
-
-    /// Пути, где модели и VAD точно нет: локальный whisper отсюда не поднять.
-    private let missing = FileManager.default.temporaryDirectory.appending(
-        path: "earmark-no-model-\(UUID().uuidString)")
-
-    private func transcriber(_ fixture: RecordingFixture, remote: RemoteWhisperClient) -> Transcriber {
-        Transcriber(
-            store: fixture.store, modelPath: missing.appending(path: "ggml-large-v3-turbo.bin"),
-            vadModelPath: missing.appending(path: "ggml-silero-v5.1.2.bin"), config: config, remote: remote)
-    }
-
-    private func run(_ transcriber: Transcriber, _ fixture: RecordingFixture) async throws(EarmarkError)
-        -> Transcript
-    {
-        try await transcriber.run(
-            folder: fixture.folder, force: false, progress: { _ in /* прогресс здесь не проверяем */ },
-            shouldAbort: { false })
-    }
-
-    @Test("совместимый сервер: оба канала распознаны на нём, локальная модель не грузится, файлы как обычно")
-    func remoteTranscribes() async throws {
-        let fixture = try RecordingFixture()
-        let served = Mutex(0)
-        let server = try FakeWhisper.server(full: { _ in
-            let channel = served.withLock {
-                $0 += 1
-                return $0
-            }
-            return channel == 1
-                ? FakeWhisper.segments([(0, 90, " первый канал ")])
-                : FakeWhisper.segments([(100, 180, " второй канал")])
-        })
-        defer { server.stop() }
-
-        let transcript = try await run(transcriber(fixture, remote: FakeWhisper.client(server)), fixture)
-
-        #expect(transcript.segments.map(\.text).sorted() == ["второй канал", "первый канал"])
-        #expect(server.paths.first == "/v1/health")
-        let channels = server.requests("/v1/full")
-        #expect(channels.count == 2)
-        #expect(channels.allSatisfy { $0.query["language"] == "ru" })
-        // 2 с стерео 48 kHz → по 32 000 сэмплов 16 kHz на канал.
-        #expect(channels.allSatisfy { abs($0.body.count / 4 - 32_000) < 1_600 })
-        let meta = try fixture.meta
-        #expect(meta.status == .transcribed)
-        #expect(meta.transcription.fingerprint == Transcriber.fingerprint)
-        let mic = try EarmarkJSON.decoder.decode(
-            ChannelTranscript.self, from: Data(contentsOf: fixture.file(RecordingFiles.transcriptMic)))
-        #expect(mic.fingerprint == Transcriber.fingerprint)
-    }
-
-    @Test("сервер недоступен — фолбэк на локальный: без модели это unavailable (69), а не remote_failed")
-    func deadServerFallsBack() async throws {
-        let fixture = try RecordingFixture()
-        let remote = RemoteWhisperClient(baseURL: try FakeWhisper.deadURL(), token: FakeWhisper.token)
-
-        let error = await #expect(throws: EarmarkError.self) {
-            try await run(transcriber(fixture, remote: remote), fixture)
-        }
-
-        #expect(error?.code == "unavailable")
-        #expect(error?.exitCode == 69)
-        let meta = try fixture.meta
-        #expect(meta.transcription.attempts == 0)
-        #expect(meta.status == .recorded)
     }
 }

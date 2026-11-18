@@ -15,22 +15,33 @@ protocol SpeechEngine: Sendable {
     ) async throws(EarmarkError) -> [RawSegment]
 }
 
-/// Примитивы whisper, над которыми одна на оба движка оркестрация (decode / decodeMulti / slice):
-/// у WhisperEngine — C-вызовы, у RemoteWhisperEngine — HTTP к серверу с тем же whisper.cpp.
-/// Синхронные: оркестрация целиком идёт на DedicatedThread. Значения сырые, как их отдаёт whisper
-/// (сантисекунды, текст как есть): перевод в мс и обрезка текста — в оркестрации, одним кодом.
+/// Отрезок речи от VAD: сырые сантисекунды whisper.
+struct VADSpan: Equatable, Sendable {
+    var t0: Float
+    var t1: Float
+}
+
+/// Сегмент whisper_full: сантисекунды и сырой текст.
+struct WhisperSegment: Equatable, Sendable {
+    var t0: Int64
+    var t1: Int64
+    var text: String
+}
+
+/// Примитивы whisper, над которыми оркестрация (decode / decodeMulti / slice). Синхронные: оркестрация
+/// целиком идёт на DedicatedThread. Значения сырые, как их отдаёт whisper (сантисекунды, текст как
+/// есть): перевод в мс и обрезка текста — в оркестрации, одним кодом.
 protocol WhisperPrimitives {
-    /// Отрезки речи Silero VAD с дефолтами (контекст n_threads = threads). shouldAbort нужен удалённому
-    /// запросу; C-вызов VAD прервать нечем.
+    /// Отрезки речи Silero VAD с дефолтами (контекст n_threads = threads). C-вызов VAD прервать нечем.
     func vad(_ samples: [Float], threads: Int32, shouldAbort: @escaping @Sendable () -> Bool)
-        throws(EarmarkError) -> [RemoteVADSpan]
+        throws(EarmarkError) -> [VADSpan]
     /// Вероятности всех языков whisper для куска; пустой кусок — [:]. shouldAbort — как у vad.
     func languageProbabilities(
         _ samples: ArraySlice<Float>, threads: Int32, shouldAbort: @escaping @Sendable () -> Bool
     ) throws(EarmarkError) -> [String: Float]
     /// Один whisper_full с эталонными параметрами; время — от начала samples.
     func whisperFull(_ samples: ArraySlice<Float>, _ params: WhisperParams, _ callbacks: Callbacks)
-        throws(EarmarkError) -> [RemoteSegment]
+        throws(EarmarkError) -> [WhisperSegment]
 }
 
 extension WhisperPrimitives {
@@ -164,7 +175,7 @@ public final class WhisperEngine: SpeechEngine, WhisperPrimitives, @unchecked Se
     /// Отрезки речи отдельным VAD: тот же Silero с дефолтами, что whisper_full берёт внутри.
     /// VAD-контекст свой на вызов и освобождается на любом выходе.
     func vad(_ samples: [Float], threads: Int32, shouldAbort _: @escaping @Sendable () -> Bool)
-        throws(EarmarkError) -> [RemoteVADSpan]
+        throws(EarmarkError) -> [VADSpan]
     {
         var contextParams = whisper_vad_default_context_params()
         contextParams.n_threads = threads
@@ -179,7 +190,7 @@ public final class WhisperEngine: SpeechEngine, WhisperPrimitives, @unchecked Se
         guard let found else { throw .operationFailed("whisper VAD failed to detect speech") }
         defer { whisper_vad_free_segments(found) }
         return (0..<whisper_vad_segments_n_segments(found)).map { index in
-            RemoteVADSpan(
+            VADSpan(
                 t0: whisper_vad_segments_get_segment_t0(found, index),
                 t1: whisper_vad_segments_get_segment_t1(found, index))
         }
@@ -207,7 +218,7 @@ public final class WhisperEngine: SpeechEngine, WhisperPrimitives, @unchecked Se
 
     /// Один whisper_full с эталонными параметрами; время сегментов — от начала samples.
     func whisperFull(_ samples: ArraySlice<Float>, _ params: WhisperParams, _ callbacks: Callbacks)
-        throws(EarmarkError) -> [RemoteSegment]
+        throws(EarmarkError) -> [WhisperSegment]
     {
         // C-колбэки не захватывают контекст: замыкания едут через user_data.
         let box = Unmanaged.passRetained(callbacks)
@@ -234,7 +245,7 @@ public final class WhisperEngine: SpeechEngine, WhisperPrimitives, @unchecked Se
         if callbacks.shouldAbort() { throw .interrupted }
         guard code == 0 else { throw .operationFailed("whisper_full returned \(code)") }
         return (0..<whisper_full_n_segments(context)).map { index in
-            RemoteSegment(
+            WhisperSegment(
                 t0: whisper_full_get_segment_t0(context, index),
                 t1: whisper_full_get_segment_t1(context, index),
                 text: whisper_full_get_segment_text(context, index).map { String(cString: $0) } ?? "")

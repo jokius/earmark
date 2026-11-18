@@ -99,8 +99,9 @@ struct SettingsView: View {
     }
 }
 
-/// Распознавание на своём сервере в LAN: переключатель, URL и что сервер отвечает сейчас.
-/// Статус — тот же checkCompatible, что у doctor и воркера: видно сразу, подошли ли URL и токен.
+/// Распознавание на своём сервере в LAN: переключатель, URL и что сервер отвечает сейчас. Без сервера
+/// записи ждут его, на маке не расшифровывается ничего. Статус — тот же checkCompatible, что у doctor
+/// и воркера: видно сразу, подошли ли URL и токен.
 private struct RemoteSection: View {
     let model: AppModel
     @State private var status: String?
@@ -121,10 +122,9 @@ private struct RemoteSection: View {
         } footer: {
             Text(
                 """
-                Off by default. When on, recordings' audio goes over your network to your own whisper \
-                server, and the token is read from \(Self.tokenPath). \
-                Traffic is not encrypted, so use it only in a network you trust. If the server is \
-                unreachable or fails, earmark transcribes on this Mac as usual.
+                Recordings are transcribed on your server in the network. If it is unreachable, they \
+                wait for it; nothing is transcribed on this Mac. The token is read from \(Self.tokenPath). \
+                Traffic is not encrypted, so use it only in a network you trust.
                 """
             )
             .font(.caption)
@@ -145,7 +145,7 @@ private struct RemoteSection: View {
                 let health = try await setup.get().checkCompatible()
                 status = health.gpu.isEmpty ? "Connected" : "Connected: \(health.gpu)"
             } catch {
-                status = "Not used now: \(error.message)"
+                status = "Unreachable, recordings wait: \(error.message)"
             }
         }
     }

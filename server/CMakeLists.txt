@@ -12,7 +12,7 @@ endif()
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(GGML_CUDA ON CACHE BOOL "" FORCE)
 # OpenMP on purpose: with ggml's own threadpool (OFF) the CPU VAD is ~6x slower here, and threads > cores spins all
-# cores for minutes. OpenMP's catch (a team per thread, kept until the thread exits) is handled by on_own_thread.
+# cores for minutes. OpenMP's catch (a team per thread, kept until the thread exits) is handled by running each job on its own short-lived thread (worker()).
 set(GGML_OPENMP ON CACHE BOOL "" FORCE)
 
 execute_process(COMMAND git -C "${WHISPER_SRC}" rev-parse HEAD

@@ -46,7 +46,9 @@ Run it first and use only the commands and options it lists. Do not guess flags 
   another service or person without explicit permission.
 - `transcription.remote.enabled` sends call audio over the network to the user's own
   transcription server. Turn it on or change `transcription.remote.url` only when the user
-  explicitly asks.
+  explicitly asks. While that server is unreachable, recordings stay `recorded` and wait for it
+  (status warning `remote_unreachable`); transcribe on this Mac with
+  `earmark transcribe <id> --local` only when the user asks for it.
 - Read transcripts in pages: `earmark transcript <id> --words 200`, and follow `next_offset`
   only when you need more.
 - If a command fails with `permission_denied` on the socket (EPERM inside a sandboxed agent such

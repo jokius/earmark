@@ -4,11 +4,15 @@ import Foundation
 import Synchronization
 import os
 
-/// `earmark transcribe <id> --now [--force]`: воркер, которого app запускает отдельным процессом
+/// `earmark transcribe <id> --now [--force] [--local]`: воркер, которого app запускает отдельным процессом
 /// (§8.3). Тот же вход годится человеку и агенту. Прогресс — JSON-строками в stdout по ходу работы,
 /// итоговый конверт — последней строкой; ошибка — конвертом в stderr с кодом выхода из спеки.
+///
+/// В удалённом режиме (transcription.remote.enabled) whisper на этом маке не запускается никогда:
+/// звук уходит на сервер, а недоступный или не настроенный сервер — повод ждать (exit 69), а не
+/// расшифровывать здесь. Локально — только `--local` (и при выключенном удалённом режиме).
 enum TranscribeNowCommand {
-    /// Что нужно воркеру: папка записи, модель и VAD.
+    /// Что нужно локальному воркеру: папка записи, модель и VAD.
     struct Job {
         let store: RecordingStore
         let folder: RecordingFolder
@@ -25,18 +29,37 @@ enum TranscribeNowCommand {
             // модели. Задача ещё не захвачена, поэтому meta не тронута и попытка не потрачена.
             throw .unavailable(error.message)
         }
-        let job = try locate(
-            id: try parsed.argument("id"), config: config, modelStore: ModelStore(),
-            vadModel: bundledVADModel())
+        let id = try parsed.argument("id")
+        let remote = RemoteTranscription.client(config: config, supportDir: EarmarkPaths.supportDir)
+        let store: RecordingStore
+        let folder: RecordingFolder
+        let transcriber: Transcriber
+        switch (parsed.flag("local"), remote) {
+        case (false, .success(let client)?):
+            // Модель и VAD здесь не нужны: их на этом маке может и не быть.
+            (store, folder) = try find(id: id, config: config)
+            transcriber = Transcriber(store: store, config: config, server: client)
+        case (false, .failure(let error)?):
+            // Не настроен — ждём, пока настроят, а не расшифровываем здесь. Задача не захвачена.
+            throw .unavailable(RemoteTranscription.waitingPrefix + error.message)
+        default:
+            if case .success(let client)? = remote {
+                // Расшифровка пойдёт здесь: задача на сервере больше не нужна. До locate — и без модели
+                // (exit 69) сервер не держит звук зря.
+                await deleteRemoteJob(id, client)
+            }
+            let job = try locate(
+                id: id, config: config, modelStore: ModelStore(), vadModel: bundledVADModel())
+            (store, folder) = (job.store, job.folder)
+            transcriber = Transcriber(
+                store: store, modelPath: job.model, vadModelPath: job.vad, config: config)
+        }
         // Обработчики сигналов — глобальное состояние процесса, поэтому только когда работа точно будет:
         // CLI-тесты, которые доходят сюда с несуществующей записью, их не ставят.
         let stop = StopSignalFlag.install()
         let output = context.output
-        let transcript = try await Transcriber(
-            store: job.store, modelPath: job.model, vadModelPath: job.vad, config: config,
-            remote: remoteClient(config)
-        ).run(
-            folder: job.folder.url, force: parsed.flag("force"),
+        let transcript = try await transcriber.run(
+            folder: folder.url, force: parsed.flag("force"),
             progress: { progress in
                 // После SIGTERM в stdout ни строки: app при выходе ждёт воркер 2 с и закрывает pipe, а
                 // whisper зовёт progress(0) после VAD раньше abort-хука — запись убила бы воркер SIGPIPE'ом
@@ -47,9 +70,19 @@ enum TranscribeNowCommand {
             shouldAbort: { stop.isRaised })
         return try encodeJSON(
             Summary(
-                id: job.folder.id ?? "", segments: transcript.segments.count,
-                durationSec: job.folder.meta?.durationSec,
-                transcript: job.folder.url.appending(path: RecordingFiles.transcript).path))
+                id: folder.id ?? "", segments: transcript.segments.count,
+                durationSec: folder.meta?.durationSec,
+                transcript: folder.url.appending(path: RecordingFiles.transcript).path))
+    }
+
+    /// Папка записи по id.
+    static func find(id: String, config: Config) throws(EarmarkError) -> (RecordingStore, RecordingFolder) {
+        let store = RecordingStore(root: config.recordingsDir)
+        let found = try disk("recordings") { try store.find(id: id) }
+        guard let folder = found else {
+            throw .notFound("recording \(id) not found in \(config.recordingsDir.path)")
+        }
+        return (store, folder)
     }
 
     /// Папка по id, модель и VAD. Без модели или VAD задачу не захватываем: meta не трогаем,
@@ -59,11 +92,7 @@ enum TranscribeNowCommand {
     static func locate(id: String, config: Config, modelStore: ModelStore, vadModel: URL?)
         throws(EarmarkError) -> Job
     {
-        let store = RecordingStore(root: config.recordingsDir)
-        let found = try disk("recordings") { try store.find(id: id) }
-        guard let folder = found else {
-            throw .notFound("recording \(id) not found in \(config.recordingsDir.path)")
-        }
+        let (store, folder) = try find(id: id, config: config)
         let state = try disk("model") { try modelStore.state(of: Models.largeV3Turbo, verify: false) }
         guard case .ready(let model) = state else {
             throw .unavailable(
@@ -78,18 +107,14 @@ enum TranscribeNowCommand {
         return Job(store: store, folder: folder, model: model, vad: vadModel)
     }
 
-    /// Сервер whisper в LAN, если режим включён и настроен. Не настроен — причина в лог, распознаём
-    /// локально: модель и VAD locate уже потребовал, фолбэку они нужны всегда.
-    private static func remoteClient(_ config: Config) -> RemoteWhisperClient? {
-        switch RemoteTranscription.client(config: config, supportDir: EarmarkPaths.supportDir) {
-        case .success(let client)?:
-            return client
-        case .failure(let error)?:
+    /// Best effort: сначала proof (токен не уходит чужому серверу), потом DELETE; любой сбой — в лог.
+    private static func deleteRemoteJob(_ id: String, _ client: RemoteTranscriptionClient) async {
+        do throws(EarmarkError) {
+            _ = try await client.checkCompatible()
+            try await client.delete(id)
+        } catch {
             Logger(subsystem: EarmarkPaths.bundleID, category: "transcription").error(
-                "remote transcription is not used: \(error.message, privacy: .public)")
-            return nil
-        case nil:
-            return nil
+                "remote job \(id, privacy: .public) is not deleted: \(error.message, privacy: .public)")
         }
     }
 

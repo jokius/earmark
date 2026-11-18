@@ -5,6 +5,13 @@ import Foundation
 
 /// Один канал записи как 16 kHz mono Float32 — вход whisper.cpp.
 public enum ChannelExtractor {
+    /// Длина канала в сэмплах на sampleRate по числу кадров файла, без декода: миллисекунды и на
+    /// многочасовой записи. С результатом extract может разойтись на хвост ресемпла.
+    public static func length(of url: URL, sampleRate: Double = 16_000) throws -> Int {
+        let input = try AVAudioFile(forReading: url)
+        return Int((Double(input.length) * sampleRate / input.fileFormat.sampleRate).rounded())
+    }
+
     /// Декод + channelMap + ресемпл, потоково: в памяти секунда входа и итоговый массив, без ffmpeg и WAV.
     public static func extract(from url: URL, channel: Int, sampleRate: Double = 16_000) throws -> [Float] {
         let input = try AVAudioFile(forReading: url)

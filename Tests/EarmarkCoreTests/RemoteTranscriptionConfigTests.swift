@@ -126,7 +126,7 @@ struct RemoteTranscriptionConfigTests {
         arguments: [
             (
                 "transcription.remote.enabled",
-                "Transcribe on your own whisper server on the LAN instead of this Mac; falls back to local whisper when it is unavailable"
+                "Transcribe on your own whisper server on the LAN instead of this Mac; when it is unreachable, recordings wait for it"
             ),
             ("transcription.remote.url", "Base URL of the whisper server, e.g. http://gpu-box.local:8178"),
         ])

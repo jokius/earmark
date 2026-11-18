@@ -18,7 +18,7 @@ done
 SSH_HOST=${HOSTS[0]:?usage: deploy.sh <ssh-host> [lan-host] [--dev]}
 LAN_HOST=${HOSTS[1]:-$SSH_HOST}
 if [ -n "$DEV" ]; then DIR=earmark-server-dev UNIT=earmark-whisper-dev PORT=8179; else DIR=earmark-server UNIT=earmark-whisper PORT=8178; fi
-COMMIT=927cfce34f31707e17f2bff35c349632fb9e2c3a  # = RemoteWhisperClient.whisperCommit (v1.9.4, b5130)
+COMMIT=927cfce34f31707e17f2bff35c349632fb9e2c3a  # = RemoteTranscriptionClient.whisperCommit (v1.9.4, b5130)
 MODEL_SHA=1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69
 VAD_SHA=29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf
 CUDA_PACKAGE=cuda-toolkit-12-9  # Blackwell (sm_120) needs CUDA >= 12.8
@@ -115,7 +115,7 @@ step "service $UNIT"
 remote bash -s -- "$DEV" <<'EOF'
 set -euo pipefail
 [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" = yes ] || sudo loginctl enable-linger "$USER"
-if [ -n "$1" ]; then
+if [ -n "${1:-}" ]; then  # ssh joins argv into one string, so an empty "$DEV" arrives as no argument at all
     # The production unit with the dev binary, token, jobs and a loopback-only listener; the same models.
     mkdir -p ~/.config/systemd/user
     sed -e 's|^Description=.*|& (development, 127.0.0.1:8179)|' \

@@ -529,6 +529,134 @@ struct RemoteTranscriberFoundJobTests {
     }
 }
 
+/// Задача, которую залил стрим записи и не поставил (receiving, source=stream), с длинами `lengths`.
+private func streamed(_ lengths: [Int]) -> FakeJob {
+    FakeJob(state: "receiving", lengths: lengths, source: "stream")
+}
+
+@Suite("Transcriber, удалённый режим: звук уже залит стримом записи (шаг 4)")
+struct RemoteTranscriberStreamedJobTests {
+    /// Стрим залил всё: длины сервера от длин m4a по кадрам в пределах допуска 1 с.
+    enum FullStream: String, CaseIterable {
+        /// Ровно длины m4a.
+        case exact
+        /// Граница допуска: mic на 1 с длиннее, system на 1 с короче.
+        case edges
+        /// Граница в другую сторону, у календаря записи свой список языков.
+        case edgesCalendarLanguages
+
+        var shift: [Int] {
+            switch self {
+            case .exact: [0, 0]
+            case .edges: [16_000, -16_000]
+            case .edgesCalendarLanguages: [-16_000, 16_000]
+            }
+        }
+
+        var calendarId: String? { self == .edgesCalendarLanguages ? "CAL-LANGS" : nil }
+        var languages: String { self == .edgesCalendarLanguages ? "ru,en,az" : "ru" }
+    }
+
+    @Test(
+        "receiving от стрима, обе длины в допуске 1 с от m4a — submit с языками записи и длинами сервера, без PUT и DELETE",
+        arguments: FullStream.allCases)
+    func fullStreamSubmitted(_ full: FullStream) async throws {
+        let fixture = try recording(calendarId: full.calendarId)
+        let languages = full.languages
+        let lengths = zip(try frameLengths(fixture), full.shift).map { $0 + $1 }
+        let server = try FakeJobServer { $0.result = fresh }
+        defer { server.stop() }
+        server.seed(id, streamed(lengths))
+        let config = Config(values: [
+            "transcription.language": .string("ru"), "calendar.CAL-LANGS.language": .string("ru,en,az"),
+        ])
+
+        let transcript = try await run(transcriber(fixture, server, config: config), fixture)
+
+        let calls = server.calls
+        #expect(!calls.contains { $0.hasPrefix("put") }, "\(calls)")
+        #expect(!calls.dropLast().contains("delete"), "\(calls)")
+        #expect(server.submits.map(\.languages) == [languages], "\(calls)")
+        #expect(server.submits.map(\.lengths) == [lengths], "\(calls)")
+        #expect(texts(transcript) == ["новое"])
+        #expect(calls.last == "delete")
+        let meta = try fixture.meta
+        #expect(meta.status == .transcribed)
+        #expect(meta.transcription.attempts == 0)
+        #expect(meta.transcription.language == languages)
+    }
+
+    @Test(
+        "receiving от стрима, в допуске лишь одна длина — как раньше: DELETE, оба канала из m4a с нуля, submit",
+        arguments: [[0, -16_001], [16_001, 0]])
+    func oneLengthOutside(shift: [Int]) async throws {
+        let fixture = try recording()
+        let local = try channels(fixture)
+        let lengths = zip(try frameLengths(fixture), shift).map { $0 + $1 }
+        let server = try FakeJobServer { $0.result = fresh }
+        defer { server.stop() }
+        server.seed(id, streamed(lengths))
+
+        let transcript = try await run(transcriber(fixture, server), fixture)
+
+        let calls = server.calls
+        let deleted = try #require(calls.firstIndex(of: "delete"), "\(calls)")
+        let uploaded = try #require(calls.firstIndex { $0.hasPrefix("put") }, "\(calls)")
+        #expect(deleted < uploaded, "\(calls)")
+        #expect((0...1).map { server.uploads(channel: $0).first?.query["offset"] } == ["0", "0"], "\(calls)")
+        #expect(server.lastSeen(id)?.samples == local)
+        #expect(server.lastSeen(id)?.source == "m4a")
+        #expect(texts(transcript) == ["новое"])
+    }
+
+    @Test("409 на submit задачи стрима — DELETE и полная перезаливка из m4a один раз, затем submit")
+    func fullStreamSubmitConflict() async throws {
+        let fixture = try recording()
+        let local = try channels(fixture)
+        let server = try FakeJobServer { $0.result = fresh }
+        defer { server.stop() }
+        server.seed(id, streamed(try frameLengths(fixture)))
+        server.script(.submit, .conflictAsIs)
+
+        let transcript = try await run(transcriber(fixture, server), fixture)
+
+        let calls = server.calls
+        let firstSubmit = try #require(calls.firstIndex(of: "submit"), "\(calls)")
+        #expect(!calls[..<firstSubmit].contains { $0.hasPrefix("put") || $0 == "delete" }, "\(calls)")
+        let tail = Array(calls[(firstSubmit + 1)...])
+        let deleted = try #require(tail.firstIndex(of: "delete"), "\(calls)")
+        let resubmitted = try #require(tail.firstIndex(of: "submit"), "\(calls)")
+        #expect(deleted < resubmitted, "\(calls)")
+        #expect(Set(tail[deleted..<resubmitted]).isSuperset(of: ["put0@0", "put1@0"]), "\(calls)")
+        #expect(server.submits.count == 2)
+        #expect(server.lastSeen(id)?.samples == local)
+        #expect(server.lastSeen(id)?.source == "m4a")
+        #expect(texts(transcript) == ["новое"])
+        #expect(try fixture.meta.status == .transcribed)
+    }
+
+    @Test(
+        "submit задачи стрима — обычная попытка: не done за limit — remote_pending (69), не засчитано, звук не перезалит"
+    )
+    func fullStreamWaitExpires() async throws {
+        let fixture = try recording()
+        let server = try FakeJobServer { $0.afterSubmit = [] }
+        defer { server.stop() }
+        server.seed(id, streamed(try frameLengths(fixture)))
+        let wait = RemoteWait(poll: .milliseconds(20), limit: .milliseconds(300))
+
+        let error = await #expect(throws: EarmarkError.self) {
+            try await run(transcriber(fixture, server, wait: wait), fixture)
+        }
+
+        #expect(error?.code == "remote_pending", "\(String(describing: error))")
+        try expectWaiting(error, fixture)
+        #expect(!server.calls.contains { $0.hasPrefix("put") }, "\(server.calls)")
+        #expect(server.submits.count == 1, "\(server.calls)")
+        #expect(server.job(id)?.state == "queued")
+    }
+}
+
 @Suite("Transcriber, удалённый режим: загрузка и конфликты")
 struct RemoteTranscriberUploadTests {
     @Test(
@@ -651,7 +779,9 @@ struct RemoteTranscriberWaitTests {
         let fixture = try recording()
         let server = try FakeJobServer { $0.afterSubmit = steps }
         defer { server.stop() }
-        let wait = RemoteWait(poll: .milliseconds(20), limit: .milliseconds(300))
+        // 600 мс, а не 300: под параллельной нагрузкой всего таргета опрос идёт раз в ~200 мс (замер),
+        // и за 300 мс успевало 1–2 опроса из трёх обязательных.
+        let wait = RemoteWait(poll: .milliseconds(20), limit: .milliseconds(600))
         let start = Date()
 
         let error = await #expect(throws: EarmarkError.self) {

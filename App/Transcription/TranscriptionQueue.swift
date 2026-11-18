@@ -49,7 +49,8 @@ final class TranscriptionQueue {
     private let config: () -> Config
     private let isRecording: () -> Bool
     /// Запись, которую ещё сводят, или ручная, по которой не ответили «какой проект?»: из бэклога её
-    /// не берём, иначе расшифровка пошла бы не на тех языках и в папке, откуда запись сейчас уедет.
+    /// не берём, иначе расшифровка пошла бы не на тех языках и в папке, откуда запись сейчас уедет. И та,
+    /// чей стрим ещё досылает звук на сервер расшифровки.
     private let isHeld: (String) -> Bool
     private let provisioner: ModelProvisioner
     private let worker: URL?

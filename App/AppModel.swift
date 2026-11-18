@@ -36,6 +36,9 @@ final class AppModel {
     private(set) var projectQuestions: [ProjectQuestion] = []
     /// Записи, которые сейчас склеиваются: очередь их не берёт, move и вторая склейка — busy.
     @ObservationIgnored private var merging: Set<String> = []
+    /// Звук идущих и только что остановленных записей на сервер расшифровки, по id записи. Остановленная
+    /// здесь, пока стрим досылает хвост: очередь её не берёт.
+    @ObservationIgnored private var streams: [String: LiveStream] = [:]
     @ObservationIgnored private lazy var projectPanels = ProjectPanels(model: self)
 
     var isRecording: Bool { session.isRecording }
@@ -43,7 +46,10 @@ final class AppModel {
     /// Запись. Зовётся из start(): AppDelegate зовёт его только после проверки TestEnvironment, так что
     /// под тестами ни захвата, ни восстановления нет. Монитор созвона держит SchedulerDriver (D28).
     func startRecordingServices() {
-        session.onStarted = { [weak self] in self?.recordingWarnings = [] }
+        session.onStarted = { [weak self] in
+            self?.recordingWarnings = []
+            self?.startStream()
+        }
         session.onWarning = { [weak self] in self?.addRecordingWarning($0) }
     }
 
@@ -145,6 +151,8 @@ final class AppModel {
                 guard let self else { return false }
                 return self.session.finalizing.contains(id) || self.merging.contains(id)
                     || self.projectQuestions.contains { $0.id == id || $0.mergeTarget?.id == id }
+                    // Стрим ещё досылает: воркер увидел бы receiving на середине и перезалил всё из m4a.
+                    || self.streams[id] != nil
             },
             provisioner: provisioner, worker: Self.cliExecutable)
         self.queue = queue
@@ -154,6 +162,7 @@ final class AppModel {
         // троих: re-arm смотрит причину стопа, отложенный ответ кладёт запись на место, очередь ставит
         // её в работу.
         session.onStopped = { [weak self] manifest, endedAt in
+            self?.finishStream(manifest, endedAt: endedAt)
             self?.recordingStopped(manifest, endedAt: endedAt)
         }
         session.onFinalized = { [weak self, weak scheduler, weak queue] _, meta in
@@ -177,6 +186,8 @@ final class AppModel {
     }
 
     func shutdown() {
+        // Не ждём: задача на сервере останется receiving, воркер после перезапуска решит по ней сам.
+        for stream in streams.values { Task { await stream.cancel() } }
         ticker?.cancel()
         server?.stop()
         queue?.shutdown()
@@ -472,12 +483,13 @@ final class AppModel {
     /// Задача записи на сервере расшифровки больше не нужна (склейка, отброшенная запись). Best effort:
     /// сначала proof — токен не уходит чужому серверу; сбой — в лог, сервер сам удалит задачу через 7 дней.
     private func deleteRemoteJob(_ id: String) {
-        guard
-            case .success(let client)? = RemoteTranscription.client(
-                config: config, supportDir: EarmarkPaths.supportDir)
-        else { return }
+        let stream = streams[id]
+        let setup = RemoteTranscription.client(config: config, supportDir: EarmarkPaths.supportDir)
         let logger = logger
         Task.detached(priority: .utility) {
+            // Стрим записи — раньше DELETE: иначе его досылка создала бы задачу заново.
+            await stream?.cancel()
+            guard case .success(let client)? = setup else { return }
             do throws(EarmarkError) {
                 _ = try await client.checkCompatible()
                 try await client.delete(id)
@@ -485,6 +497,49 @@ final class AppModel {
                 logger.error(
                     "remote job \(id, privacy: .public) is not deleted: \(error.message, privacy: .public)")
             }
+        }
+    }
+
+    /// Старт записи: звук сразу уходит на сервер расшифровки, если удалённый режим включён и настроен.
+    /// Кривой конфиг — стрима нет: звук дольёт воркер после стопа. Старт записи стрим не ждёт.
+    private func startStream() {
+        guard config.transcriptionEnabled, let current = session.current,
+            case .success(let client)? = RemoteTranscription.client(
+                config: config, supportDir: EarmarkPaths.supportDir)
+        else { return }
+        let folder = URL(fileURLWithPath: current.folder)
+        let stream = LiveStream(
+            id: current.id, mic: folder.appending(path: RecordingFiles.mic),
+            system: folder.appending(path: RecordingFiles.system), server: client)
+        streams[current.id] = stream
+        Task { await stream.start() }
+    }
+
+    /// Стоп, CAF закрыты: стрим досылает хвост в фоне. Авто-запись он сразу ставит в очередь сервера —
+    /// мак можно закрыть после созвона; ручную (ждёт ответа о проекте) и отбрасываемую — нет, ручную
+    /// поставит воркер.
+    private func finishStream(_ manifest: RecordingManifest, endedAt: Date) {
+        guard let stream = streams[manifest.id] else { return }
+        let discard = StopRules.shouldDiscard(
+            trigger: manifest.trigger, duration: endedAt.timeIntervalSince(manifest.startedAt),
+            config: config.stop)
+        let languages =
+            manifest.trigger == .calendar && !discard
+            ? config.transcriptionLanguage(forCalendar: manifest.calendar?.id) : nil
+        Task { [weak self] in
+            // Отбрасываемую не досылаем: onDiscarded удаляет задачу, а летящая досылка создала бы её снова.
+            if discard { await stream.cancel() }
+            let sent = await stream.finish(languages: languages)
+            let failure = await stream.failure
+            guard let self else { return }
+            streams[manifest.id] = nil
+            if sent {
+                logger.info("stream of \(manifest.id, privacy: .public) delivered")
+            } else {
+                logger.error(
+                    "stream of \(manifest.id, privacy: .public): \(failure ?? "cancelled", privacy: .public)")
+            }
+            queue?.requestScan()
         }
     }
 
@@ -633,6 +688,14 @@ final class AppModel {
             try configStore.save(next)
         } catch {
             throw EarmarkError.operationFailed("cannot save config: \(error.localizedDescription)")
+        }
+        // Стрим идёт по конфигу на старте записи: выключили расшифровку или удалённый режим, сменили
+        // сервер — звук больше не уходит; после стопа запись пойдёт по новому конфигу.
+        if next.transcriptionEnabled != config.transcriptionEnabled
+            || next.remoteTranscriptionEnabled != config.remoteTranscriptionEnabled
+            || next.remoteTranscriptionURL != config.remoteTranscriptionURL
+        {
+            for stream in streams.values { Task { await stream.cancel() } }
         }
         config = next
         configProblem = nil

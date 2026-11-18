@@ -14,6 +14,8 @@ struct FakeRequest: Sendable {
     /// Имена в нижнем регистре.
     var headers: [String: String]
     var body: Data
+    /// Номер запроса в журнале сервера (порядок приёма).
+    var index = 0
 
     /// Тип тела без параметров (`; charset=…`), в нижнем регистре; nil — заголовка нет.
     var mediaType: String? {
@@ -172,7 +174,10 @@ final class FakeWhisperServer: Sendable {
             guard let body = reader.readChunked() else { return }
             request.body = body
         }
-        state.withLock { $0.requests.append(request) }
+        state.withLock {
+            request.index = $0.requests.count
+            $0.requests.append(request)
+        }
         handler(request, connection)
     }
 }
@@ -379,6 +384,10 @@ final class FakeJobServer: Sendable {
         book.state.withLock { $0.scripts[endpoint, default: []].append(contentsOf: replies) }
     }
 
+    /// Номера в `calls` запросов, получивших ответ по сценарию, в порядке ответа: запросы параллельны,
+    /// и «следующий к эндпоинту» по журналу не всегда тот, кому достался сценарий.
+    var scriptedAt: [Int] { book.state.withLock { $0.scriptedAt } }
+
     /// PUT канала по порядку.
     func uploads(channel: Int) -> [FakeRequest] {
         requests.filter { JobBook.route($0)?.endpoint == .upload && JobBook.route($0)?.channel == channel }
@@ -413,6 +422,7 @@ private final class JobBook: Sendable {
         var jobs: [String: FakeJob] = [:]
         var deleted: [String: FakeJob] = [:]
         var scripts: [FakeJobServer.Endpoint: [FakeJobServer.Scripted]] = [:]
+        var scriptedAt: [Int] = []
     }
 
     struct Route {
@@ -451,6 +461,7 @@ private final class JobBook: Sendable {
             guard let route = Self.route(request) else { return .respond(404, Self.error("not found")) }
             if let scripted = state.scripts[route.endpoint]?.first {
                 state.scripts[route.endpoint]?.removeFirst()
+                state.scriptedAt.append(request.index)
                 return Self.play(scripted, route, &state)
             }
             return Self.serve(request, route, &state)

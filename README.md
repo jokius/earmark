@@ -240,20 +240,29 @@ Settings window stay on the Mac; whisper runs only on the server.
   what is missing. Nothing is transcribed on the Mac unless you ask for it:
   `earmark transcribe <id> --local`. The local model is not needed in this mode; `earmark doctor`
   lists it for information only.
-- **The server finishes on its own.** The Mac uploads both channels as a job and submits it, then
-  waits up to 30 seconds for the result; a longer job is picked up on a later try, which only asks
-  the server and does not decode the recording again. If the Mac sleeps or leaves right after the
-  call, the server still transcribes it, and the Mac fetches the text when it is back. A failure on
-  the server counts as a failed attempt, like a crash of local whisper: the next try submits the job
-  again, and that try counts too, even if the server goes down before it finishes. After 3 failed
-  attempts the recording is `transcription_failed`; `earmark transcribe <id> --force` starts over.
-- **What goes over the network**: the decoded audio of each channel (16 kHz PCM) and the resulting
-  text, over plain HTTP. Before it sends the token or any audio, the Mac makes the server prove it
-  holds the shared token (an HMAC of a fresh random challenge), so a device that merely answers to
-  the same name or address in another network, say in a hotel, gets neither, and the recording
-  waits. The check runs once per try, so switching networks in the middle of an upload is not
-  covered. The traffic itself, the token included, is not encrypted, so anyone who can watch your
-  home network can read it: use the mode only in a network you trust.
+- **Audio goes to the server while you record.** Every 2 seconds the Mac sends the new audio of both
+  channels, and when a calendar recording stops, the job is queued on the server at once, so you can
+  close the laptop right after the call. A manual recording goes to the server's queue later, when
+  the Mac's own queue reaches it (after the project question, if one is asked). If the stream breaks
+  off early (server unreachable, another network), the recording is not affected: after the stop
+  the Mac uploads its audio from the recording itself. A stream cut in the last second (the app quit
+  mid-recording) may be used as is, without that last second.
+- **The server finishes on its own.** The Mac uploads both channels as a job (unless the stream
+  already has) and submits it, then waits up to 30 seconds for the result; a longer job is picked up
+  on a later try, which only asks the server and does not decode the recording again. If the Mac
+  sleeps or leaves right after the call, the server still transcribes it, and the Mac fetches the
+  text when it is back. A failure on the server counts as a failed attempt, like a crash of local
+  whisper: the next try submits the job again, and that try counts too, even if the server goes down
+  before it finishes. After 3 failed attempts the recording is `transcription_failed`;
+  `earmark transcribe <id> --force` starts over.
+- **What goes over the network**: the audio of each channel (16 kHz PCM), raw and during the
+  recording too, and the resulting text, over plain HTTP. Before it sends the token or any audio,
+  the Mac makes the server prove it holds the shared token (an HMAC of a fresh random challenge), so
+  a device that merely answers to the same name or address in another network, say in a hotel, gets
+  neither, and the recording waits. During the recording the check runs before every portion of
+  audio; after it, once per try, so switching networks in the middle of that upload is not covered.
+  The traffic itself, the token included, is not encrypted, so anyone who can watch your home
+  network can read it: use the mode only in a network you trust.
 - **What stays on the server**: the audio and the transcript of a job, on disk, until the Mac has
   picked up the result (then the job is deleted), and for 7 days at most. Its log has only
   metadata: requests (client address, path with the recording id, status, time) and jobs

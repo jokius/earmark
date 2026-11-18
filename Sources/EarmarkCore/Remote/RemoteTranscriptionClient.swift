@@ -105,6 +105,9 @@ public struct RemoteTranscriptionClient: Sendable {
         }
     }
 
+    /// Наибольший PUT: 8 Mi сэмплов = 32 MiB, вдвое меньше лимита тела у сервера.
+    public static let uploadChunk = 8_388_608
+
     /// Коммит whisper.cpp, с которым доказан паритет (= b5130 = v1.9.4).
     public static let whisperCommit = "927cfce34f31707e17f2bff35c349632fb9e2c3a"
 

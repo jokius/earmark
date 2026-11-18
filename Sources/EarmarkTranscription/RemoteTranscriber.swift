@@ -36,8 +36,7 @@ struct RemoteAttempt: Sendable {
     let server: RemoteTranscriptionClient
     let shouldAbort: @Sendable () -> Bool
 
-    /// Кусок загрузки: 8 Mi сэмплов = 32 MiB, вдвое меньше лимита тела у сервера.
-    static let uploadChunk = 8_388_608
+    static let uploadChunk = RemoteTranscriptionClient.uploadChunk
     /// Задача сервера — та же запись, если длины каналов расходятся с audio.m4a не больше чем на 1 с
     /// (стрим пишет из CAF, а m4a — их сведение с ресемплом).
     static let lengthTolerance = 16_000
@@ -99,17 +98,25 @@ struct RemoteAttempt: Sendable {
 
     /// Задача сервера, которую можно ждать, и текст её сбоя на сервере, если её пришлось поставить снова
     /// (такой прогон засчитан). Готовую (queued/running/done) с теми же языками и длинами берём как есть;
-    /// failed — ставим снова; receiving из m4a докачиваем; остальное (нет задачи, стрим, другие языки или
-    /// длины после склейки и смены проекта) — удалить и залить оба канала из m4a заново.
+    /// failed — ставим снова; receiving от стрима полной длины — ставим; receiving из m4a докачиваем;
+    /// остальное (нет задачи, оборванный стрим, другие языки или длины после склейки и смены проекта) —
+    /// удалить и залить оба канала из m4a заново.
     private func prepare(_ folder: URL) async throws(EarmarkError) -> (job: RemoteJob, failure: String?) {
         let audio = folder.appending(path: RecordingFiles.audio)
         // Сверка — по заголовку m4a, без декода: прогон, который только ждёт сервер (раз в минуту), должен
         // стоить маку миллисекунды, а не декод многочасовой записи.
         let length = try Transcriber.length(audio)
         let existing = try await call { [server, id] in try await server.job(id) }
-        if let job = existing, job.languages == language, job.lengths.count == 2,
-            job.lengths.allSatisfy({ abs($0 - length) <= Self.lengthTolerance })
-        {
+        let fits =
+            existing.map { job in
+                job.lengths.count == 2 && job.lengths.allSatisfy { abs($0 - length) <= Self.lengthTolerance }
+            } ?? false
+        // Весь звук уже дослал стрим записи, а submit не делал (ручная ждала ответа о проекте, авто не
+        // успела): ставим его как есть, ничего не загружая. Обычная попытка, не повтор упавшей.
+        if let job = existing, fits, job.state == .receiving, job.source == .stream {
+            return (try await submit(lengths: job.lengths, audio: audio, samples: nil, reupload: true), nil)
+        }
+        if let job = existing, fits, job.languages == language {
             switch job.state {
             case .queued, .running, .done:
                 return (job, nil)
